@@ -9,9 +9,10 @@ import (
 	"context"
 	"fmt"
 	"image/color"
+	"io"
 	"log/slog"
 	"net"
-	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,10 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/storage"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 	"gopkg.in/yaml.v3"
 
@@ -33,10 +38,24 @@ import (
 )
 
 var (
-	colGreen = color.NRGBA{R: 0x2e, G: 0xcc, B: 0x71, A: 0xff}
-	colAmber = color.NRGBA{R: 0xf3, G: 0x9c, B: 0x12, A: 0xff}
-	colGrey  = color.NRGBA{R: 0x95, G: 0xa5, B: 0xa6, A: 0xff}
-	colRed   = color.NRGBA{R: 0xe7, G: 0x4c, B: 0x3c, A: 0xff}
+	colGreen  = color.NRGBA{R: 0x2e, G: 0xcc, B: 0x71, A: 0xff}
+	colAmber  = color.NRGBA{R: 0xf3, G: 0x9c, B: 0x12, A: 0xff}
+	colGrey   = color.NRGBA{R: 0x95, G: 0xa5, B: 0xa6, A: 0xff}
+	colRed    = color.NRGBA{R: 0xe7, G: 0x4c, B: 0x3c, A: 0xff}
+	colYellow = color.NRGBA{R: 0xf1, G: 0xc4, B: 0x0f, A: 0xff}
+)
+
+// maxLogLines caps the log pane's scrollback.
+const maxLogLines = 400
+
+// screenFraction is how much of the usable screen height the window takes at
+// startup, leaving the frame clear of the taskbar.
+const screenFraction = 0.88
+
+// localAddr / lanAddr are swapped in the listen fields by the "allow LAN" check.
+const (
+	localAddr = "127.0.0.1"
+	lanAddr   = "0.0.0.0"
 )
 
 type ui struct {
@@ -47,17 +66,29 @@ type ui struct {
 	key      *widget.Entry
 	trans    *widget.Select
 	srvPort  *widget.Entry
+	srvSpan  *widget.Entry
 	cliPort  *widget.Entry
+	cliSpan  *widget.Entry
 	mtu      *widget.Entry
 	socks    *widget.Entry
 	forwards *widget.Entry
 	firewall *widget.Check
+	lan      *widget.Check
+	loadBtn  *widget.Button
+	saveBtn  *widget.Button
 
 	connectBtn *widget.Button
 	status     *canvas.Text
 	rate       *canvas.Text
-	logEntry   *widget.Entry
+	logView    *widget.RichText
 	logScroll  *container.Scroll
+	autoScroll *widget.Check
+
+	// settingsTheme dims the input backgrounds of the settings block while the
+	// tunnel runs; split/naturalTop drive the startup geometry.
+	settingsTheme *container.ThemeOverride
+	split         *container.Split
+	naturalTop    float32
 
 	logger *slog.Logger
 	logh   *uiLogHandler
@@ -69,10 +100,11 @@ type ui struct {
 
 func main() {
 	a := app.NewWithID("org.gfwknocker.gfk")
+	a.Settings().SetTheme(gfkTheme{Theme: theme.DefaultTheme()})
 	w := a.NewWindow("gfk — GFW Knocker")
 	u := newUI(w)
 	w.SetContent(u.build())
-	w.Resize(fyne.NewSize(660, 720))
+	w.Resize(fyne.NewSize(740, 720)) // fallback; applyStartSize refines it below
 
 	if !isElevated() {
 		u.logger.Warn("not running as Administrator — raw sockets, Npcap and firewall changes will fail; restart elevated")
@@ -83,7 +115,36 @@ func main() {
 		u.disconnect()
 		w.Close()
 	})
-	w.ShowAndRun()
+	// Show before Run so the canvas scale is known; ShowAndRun would deny us the
+	// chance to size the window against the real screen.
+	w.Show()
+	u.applyStartSize()
+	a.Run()
+}
+
+// applyStartSize sizes the window to a fraction of the usable screen height and
+// parks the divider just below the settings, so every field is visible and the
+// log takes whatever is left.
+func (u *ui) applyStartSize() {
+	px := usableContentHeightPx()
+	if px <= 0 {
+		return // unknown screen: keep the fallback size
+	}
+	scale := u.win.Canvas().Scale()
+	if scale <= 0 {
+		scale = 1
+	}
+	height := float32(px) * screenFraction / scale
+	if height < u.naturalTop {
+		height = u.naturalTop // never start smaller than the settings need
+	}
+	u.win.Resize(fyne.NewSize(u.win.Canvas().Size().Width, height))
+
+	offset := float64(u.naturalTop / height)
+	if offset > 0.85 {
+		offset = 0.85
+	}
+	u.split.SetOffset(offset)
 }
 
 func newUI(w fyne.Window) *ui {
@@ -95,42 +156,45 @@ func newUI(w fyne.Window) *ui {
 	u.trans = widget.NewSelect([]string{string(config.TransportKCP), string(config.TransportQUIC)}, nil)
 	u.trans.SetSelected(string(d.Transport))
 	u.srvPort = entry(strconv.Itoa(int(d.Carrier.ServerPort)))
+	u.srvSpan = entry(strconv.Itoa(d.Carrier.ServerPortSpan))
 	u.cliPort = entry(strconv.Itoa(int(d.Carrier.ClientPort)))
+	u.cliSpan = entry(strconv.Itoa(d.Carrier.ClientPortSpan))
 	u.mtu = entry(strconv.Itoa(d.Carrier.MTU))
-	u.socks = entry("127.0.0.1:1080")
+	u.socks = entry(localAddr + ":1080")
 	u.forwards = widget.NewMultiLineEntry()
-	u.forwards.SetPlaceHolder("one per line:  tcp 127.0.0.1:14000 443")
+	u.forwards.SetPlaceHolder("one per line:  tcp " + localAddr + ":14000 443")
 	u.firewall = widget.NewCheck("Manage firewall RST rules (recommended)", nil)
 	u.firewall.SetChecked(true)
+	// Label kept short: it shares a row with the firewall check.
+	u.lan = widget.NewCheck("Allow connections from LAN ("+lanAddr+")", u.onLANToggle)
 
 	u.status = canvas.NewText("○ disconnected", colGrey)
 	u.status.TextStyle = fyne.TextStyle{Bold: true}
 	u.rate = canvas.NewText("↓ 0 B/s   ↑ 0 B/s", colGrey)
 
-	u.logEntry = widget.NewMultiLineEntry()
-	u.logEntry.Wrapping = fyne.TextWrapWord
-	u.logScroll = container.NewScroll(u.logEntry)
-	u.logh = &uiLogHandler{level: slog.LevelInfo, set: func(s string) {
-		u.logEntry.SetText(s)
-		u.logScroll.ScrollToBottom()
-	}}
+	u.logView = widget.NewRichText()
+	u.logView.Wrapping = fyne.TextWrapWord
+	u.logScroll = container.NewVScroll(u.logView)
+	u.autoScroll = widget.NewCheck("Auto-scroll", nil)
+	u.autoScroll.SetChecked(true)
+
+	u.logh = &uiLogHandler{level: slog.LevelInfo, append: u.appendLog}
 	u.logger = slog.New(u.logh)
 	return u
 }
 
 func (u *ui) build() fyne.CanvasObject {
+	u.loadBtn = widget.NewButton("Load", u.loadConfig)
+	u.saveBtn = widget.NewButton("Save", u.saveConfig)
+
 	form := widget.NewForm(
 		widget.NewFormItem("Config file", container.NewBorder(nil, nil, nil,
-			container.NewHBox(
-				widget.NewButton("Load", u.loadConfig),
-				widget.NewButton("Save", u.saveConfig),
-			), u.cfgPath)),
+			container.NewHBox(u.loadBtn, u.saveBtn), u.cfgPath)),
 		widget.NewFormItem("VPS IP", u.vps),
 		widget.NewFormItem("Shared key", u.key),
-		widget.NewFormItem("Transport", u.trans),
-		widget.NewFormItem("Server port", u.srvPort),
-		widget.NewFormItem("Client port", u.cliPort),
-		widget.NewFormItem("MTU", u.mtu),
+		widget.NewFormItem("Transport", trailingField(u.trans, "MTU", u.mtu)),
+		widget.NewFormItem("Server port", trailingField(u.srvPort, "+ span", u.srvSpan)),
+		widget.NewFormItem("Client port", trailingField(u.cliPort, "+ span", u.cliSpan)),
 		widget.NewFormItem("SOCKS5 listen", u.socks),
 		widget.NewFormItem("Forwards", u.forwards),
 	)
@@ -139,9 +203,41 @@ func (u *ui) build() fyne.CanvasObject {
 	u.connectBtn.Importance = widget.HighImportance
 
 	statusBar := container.NewHBox(u.status, widget.NewLabel("   "), u.rate)
-	top := container.NewVBox(form, u.firewall, u.connectBtn, widget.NewSeparator(), statusBar, widget.NewSeparator())
 
-	return container.NewBorder(top, nil, nil, nil, u.logScroll)
+	// Settings scroll so they narrow gracefully; Connect + status stay pinned to
+	// the bottom of the top pane so they are reachable however it is sized. The
+	// theme override lets the whole block grey out while the tunnel runs.
+	checks := container.NewGridWithColumns(2, u.firewall, u.lan)
+	settingsBox := container.NewVBox(form, checks)
+	u.settingsTheme = container.NewThemeOverride(settingsBox, gfkTheme{Theme: theme.DefaultTheme()})
+	settings := container.NewVScroll(u.settingsTheme)
+	settings.SetMinSize(fyne.NewSize(0, 120))
+	controls := container.NewVBox(widget.NewSeparator(), u.connectBtn, statusBar)
+	topPane := container.NewBorder(nil, controls, nil, nil, settings)
+	u.naturalTop = settingsBox.MinSize().Height + controls.MinSize().Height + 4*theme.Padding()
+
+	logBar := container.NewHBox(
+		widget.NewLabelWithStyle("Log", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		layout.NewSpacer(),
+		u.autoScroll,
+		widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), u.copyLog),
+		widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), u.clearLog),
+	)
+	logPane := container.NewBorder(logBar, nil, nil, nil, u.logScroll)
+
+	// Draggable divider: the log area is flexible and user-adjustable.
+	u.split = container.NewVSplit(topPane, logPane)
+	u.split.SetOffset(0.74)
+	return u.split
+}
+
+// trailingField puts a second, narrow labelled field on the right of a form row
+// so related settings (port + span, transport + MTU) share one line. The label is
+// bold and colon-suffixed to match the form's own labels.
+func trailingField(main fyne.CanvasObject, label string, trailing *widget.Entry) fyne.CanvasObject {
+	name := widget.NewLabelWithStyle(label+":", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
+	sized := container.New(layout.NewGridWrapLayout(fyne.NewSize(90, trailing.MinSize().Height)), trailing)
+	return container.NewBorder(nil, nil, nil, container.NewHBox(name, sized), main)
 }
 
 func (u *ui) toggle() {
@@ -250,7 +346,8 @@ func (u *ui) setStatusText(s string, c color.Color) {
 }
 
 func (u *ui) setInputs(enabled bool) {
-	widgets := []fyne.Disableable{u.vps, u.key, u.trans, u.srvPort, u.cliPort, u.mtu, u.socks, u.forwards, u.firewall, u.cfgPath}
+	widgets := []fyne.Disableable{u.vps, u.key, u.trans, u.srvPort, u.srvSpan, u.cliPort, u.cliSpan,
+		u.mtu, u.socks, u.forwards, u.firewall, u.lan, u.cfgPath, u.loadBtn, u.saveBtn}
 	for _, wdg := range widgets {
 		if enabled {
 			wdg.Enable()
@@ -258,6 +355,30 @@ func (u *ui) setInputs(enabled bool) {
 			wdg.Disable()
 		}
 	}
+	// Grey the field backgrounds too, which Disable() alone does not do.
+	u.settingsTheme.Theme = gfkTheme{Theme: theme.DefaultTheme(), dimInputs: !enabled}
+	u.settingsTheme.Refresh()
+}
+
+// onLANToggle rewrites the listen addresses so the forwards and the SOCKS5
+// proxy are reachable from the local network (or only from this machine).
+func (u *ui) onLANToggle(on bool) {
+	from, to := localAddr, lanAddr
+	if !on {
+		from, to = lanAddr, localAddr
+	}
+	for _, e := range []*widget.Entry{u.socks, u.forwards} {
+		if strings.Contains(e.Text, from) {
+			e.SetText(strings.ReplaceAll(e.Text, from, to))
+		}
+	}
+}
+
+// syncLAN aligns the checkbox with the listen addresses currently in the form
+// without triggering another rewrite.
+func (u *ui) syncLAN() {
+	u.lan.Checked = strings.Contains(u.socks.Text, lanAddr) || strings.Contains(u.forwards.Text, lanAddr)
+	u.lan.Refresh()
 }
 
 // buildConfig assembles and validates a client config from the form fields.
@@ -268,6 +389,8 @@ func (u *ui) buildConfig() (config.Config, error) {
 	cfg.Carrier.VPSIP = strings.TrimSpace(u.vps.Text)
 	cfg.Carrier.ServerPort = atou16(u.srvPort.Text, cfg.Carrier.ServerPort)
 	cfg.Carrier.ClientPort = atou16(u.cliPort.Text, cfg.Carrier.ClientPort)
+	cfg.Carrier.ServerPortSpan = atoiDef(u.srvSpan.Text, cfg.Carrier.ServerPortSpan)
+	cfg.Carrier.ClientPortSpan = atoiDef(u.cliSpan.Text, cfg.Carrier.ClientPortSpan)
 	if m, err := strconv.Atoi(strings.TrimSpace(u.mtu.Text)); err == nil {
 		cfg.Carrier.MTU = m
 	}
@@ -291,21 +414,47 @@ func (u *ui) applyConfig(cfg config.Config) {
 	u.key.SetText(cfg.Auth.Key)
 	u.trans.SetSelected(string(cfg.Transport))
 	u.srvPort.SetText(strconv.Itoa(int(cfg.Carrier.ServerPort)))
+	u.srvSpan.SetText(strconv.Itoa(cfg.Carrier.ServerPortSpan))
 	u.cliPort.SetText(strconv.Itoa(int(cfg.Carrier.ClientPort)))
+	u.cliSpan.SetText(strconv.Itoa(cfg.Carrier.ClientPortSpan))
 	u.mtu.SetText(strconv.Itoa(cfg.Carrier.MTU))
 	u.socks.SetText(cfg.Client.Socks5Listen)
 	u.forwards.SetText(forwardsToText(cfg.Client.Forwards))
 	u.firewall.SetChecked(cfg.Firewall.Manage != config.FirewallNo)
+	u.syncLAN()
 }
 
 func (u *ui) loadConfig() {
-	cfg, err := config.Load(strings.TrimSpace(u.cfgPath.Text))
-	if err != nil {
-		u.logger.Error("load config failed", "err", err)
-		return
-	}
-	u.applyConfig(cfg)
-	u.logger.Info("config loaded", "path", u.cfgPath.Text)
+	d := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
+		if err != nil {
+			u.logger.Error("open config failed", "err", err)
+			return
+		}
+		if rc == nil {
+			return // cancelled
+		}
+		defer rc.Close()
+		raw, err := io.ReadAll(rc)
+		if err != nil {
+			u.logger.Error("read config failed", "err", err)
+			return
+		}
+		cfg := config.Default()
+		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+			u.logger.Error("parse config failed", "err", err)
+			return
+		}
+		path := localPath(rc.URI())
+		u.cfgPath.SetText(path)
+		u.applyConfig(cfg)
+		u.logger.Info("config loaded", "path", path)
+		// Fields are populated either way; a bad file is a warning, not a stop.
+		if err := cfg.Validate(); err != nil {
+			u.logger.Warn("config needs fixing before connecting", "err", err)
+		}
+	}, u.win)
+	d.SetFilter(storage.NewExtensionFileFilter([]string{".yaml", ".yml"}))
+	u.showFileDialog(d, false)
 }
 
 func (u *ui) saveConfig() {
@@ -319,11 +468,128 @@ func (u *ui) saveConfig() {
 		u.logger.Error("marshal failed", "err", err)
 		return
 	}
-	if err := os.WriteFile(strings.TrimSpace(u.cfgPath.Text), out, 0o644); err != nil {
-		u.logger.Error("write config failed", "err", err)
-		return
+	d := dialog.NewFileSave(func(wc fyne.URIWriteCloser, err error) {
+		if err != nil {
+			u.logger.Error("save config failed", "err", err)
+			return
+		}
+		if wc == nil {
+			return // cancelled
+		}
+		defer wc.Close()
+		if _, err := wc.Write(out); err != nil {
+			u.logger.Error("write config failed", "err", err)
+			return
+		}
+		path := localPath(wc.URI())
+		u.cfgPath.SetText(path)
+		u.logger.Info("config saved", "path", path)
+	}, u.win)
+	d.SetFilter(storage.NewExtensionFileFilter([]string{".yaml", ".yml"}))
+	u.showFileDialog(d, true)
+}
+
+// showFileDialog seeds the chooser from whatever is in the config-path field and
+// opens it at a usable size. Resize must follow Show: FileDialog.Resize consults
+// MinSize, which panics before the dialog has been built (fyne v2.8.0).
+func (u *ui) showFileDialog(d *dialog.FileDialog, save bool) {
+	if p := strings.TrimSpace(u.cfgPath.Text); p != "" {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+		}
+		if lister, err := storage.ListerForURI(storage.NewFileURI(filepath.Dir(p))); err == nil {
+			d.SetLocation(lister)
+		}
+		if save {
+			d.SetFileName(filepath.Base(p))
+		}
 	}
-	u.logger.Info("config saved", "path", u.cfgPath.Text)
+	d.Show()
+	d.Resize(fyne.NewSize(720, 520))
+}
+
+// localPath turns a file:// URI from the chooser into an OS path.
+func localPath(u fyne.URI) string {
+	if u == nil {
+		return ""
+	}
+	return filepath.FromSlash(u.Path())
+}
+
+// ---- log pane ----
+
+// appendLog adds one already-formatted record to the log pane. Must run on the
+// Fyne goroutine.
+func (u *ui) appendLog(level slog.Level, line string) {
+	seg := &widget.TextSegment{Text: line, Style: widget.RichTextStyle{ColorName: logColorName(level)}}
+	u.logView.Segments = append(u.logView.Segments, seg)
+	if n := len(u.logView.Segments); n > maxLogLines {
+		u.logView.Segments = append([]widget.RichTextSegment(nil), u.logView.Segments[n-maxLogLines:]...)
+	}
+	u.logView.Refresh()
+	if u.autoScroll.Checked {
+		u.logScroll.ScrollToBottom()
+	}
+}
+
+func logColorName(level slog.Level) fyne.ThemeColorName {
+	switch {
+	case level >= slog.LevelError:
+		return theme.ColorNameError
+	case level >= slog.LevelWarn:
+		return theme.ColorNameWarning
+	case level < slog.LevelInfo:
+		return theme.ColorNameDisabled
+	default:
+		return theme.ColorNameForeground
+	}
+}
+
+func (u *ui) clearLog() {
+	u.logView.Segments = nil
+	u.logView.Refresh()
+	u.logScroll.Refresh()
+}
+
+func (u *ui) copyLog() {
+	lines := make([]string, 0, len(u.logView.Segments))
+	for _, s := range u.logView.Segments {
+		lines = append(lines, s.Textual())
+	}
+	fyne.CurrentApp().Clipboard().SetContent(strings.Join(lines, "\n"))
+}
+
+// gfkTheme keeps disabled text legible — Fyne's default disabled grey is nearly
+// the background colour — while still reading as greyed out, and pins
+// error/warning to the app's palette. With dimInputs set it also greys the entry
+// backgrounds, which Fyne itself does not vary by disabled state; the settings
+// block switches to that variant while the tunnel runs.
+type gfkTheme struct {
+	fyne.Theme
+
+	dimInputs bool
+}
+
+func (t gfkTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	light := v == theme.VariantLight
+	switch n {
+	case theme.ColorNameDisabled:
+		// Mid grey: paler than the light-theme foreground (#565656), darker than
+		// the dark-theme one (#f3f3f3), so both read as dimmed but readable.
+		return color.NRGBA{R: 0x8c, G: 0x8c, B: 0x8c, A: 0xff}
+	case theme.ColorNameInputBackground:
+		if t.dimInputs {
+			if light {
+				return color.NRGBA{R: 0xe4, G: 0xe4, B: 0xe4, A: 0xff}
+			}
+			return color.NRGBA{R: 0x2b, G: 0x2b, B: 0x2f, A: 0xff}
+		}
+	case theme.ColorNameError:
+		return colRed
+	case theme.ColorNameWarning:
+		return colYellow
+	}
+	return t.Theme.Color(n, v)
 }
 
 // ---- engine ----
@@ -438,6 +704,13 @@ func atou16(s string, def uint16) uint16 {
 	return def
 }
 
+func atoiDef(s string, def int) int {
+	if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
+		return v
+	}
+	return def
+}
+
 func parseForwards(s string) ([]config.Forward, error) {
 	var fs []config.Forward
 	for _, ln := range strings.Split(s, "\n") {
@@ -481,10 +754,8 @@ func humanBytes(n uint64) string {
 
 // uiLogHandler is an slog.Handler that renders records into the log pane.
 type uiLogHandler struct {
-	level slog.Level
-	set   func(string)
-	mu    sync.Mutex
-	lines []string
+	level  slog.Level
+	append func(slog.Level, string)
 }
 
 func (h *uiLogHandler) Enabled(_ context.Context, l slog.Level) bool { return l >= h.level }
@@ -496,14 +767,8 @@ func (h *uiLogHandler) Handle(_ context.Context, r slog.Record) error {
 		fmt.Fprintf(&sb, "  %s=%v", a.Key, a.Value.Any())
 		return true
 	})
-	h.mu.Lock()
-	h.lines = append(h.lines, sb.String())
-	if len(h.lines) > 400 {
-		h.lines = h.lines[len(h.lines)-400:]
-	}
-	text := strings.Join(h.lines, "\n")
-	h.mu.Unlock()
-	fyne.Do(func() { h.set(text) })
+	line, level := sb.String(), r.Level
+	fyne.Do(func() { h.append(level, line) })
 	return nil
 }
 
