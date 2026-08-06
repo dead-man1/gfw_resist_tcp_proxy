@@ -213,6 +213,67 @@ func Default() Config {
 	}
 }
 
+// EffectiveAttrs returns the settings that actually took effect, as slog
+// key/value pairs, for a single "this is what I am running with" line at
+// startup. It covers every knob the Windows GUI has no widget for (interface,
+// the kcp/quic tuning, tcp_flags, seq_mode, the keepalive/reconnect timers,
+// log_level), which is the only way a GUI user can confirm that a value set in
+// their YAML was honoured rather than silently replaced by a default.
+//
+// auth.key is deliberately absent: this line is meant to be pasteable.
+func (c Config) EffectiveAttrs() []any {
+	// Report what the carrier will actually do, not the raw strings: an omitted
+	// or blank tcp_flags/seq_mode resolves to the default, and printing "" there
+	// would be misleading in a line titled "settings in effect". Validate has
+	// already rejected anything unparseable, so the errors cannot bite here.
+	flags, _ := carrier.ParseTCPFlags(c.Carrier.TCPFlags)
+	seqMode, _ := carrier.ParseSeqMode(c.Carrier.SeqMode)
+	a := []any{
+		"transport", string(c.Transport),
+		"interface", c.Carrier.Interface,
+		"mtu", c.Carrier.MTU,
+		"server_port", c.Carrier.ServerPort,
+		"server_port_span", c.Carrier.ServerPortSpan,
+		"tcp_flags", flags.String(),
+		"seq_mode", string(seqMode),
+		"log_level", c.LogLevel,
+	}
+	if c.Mode == ModeClient {
+		a = append(a,
+			"client_port", c.Carrier.ClientPort,
+			"client_port_span", c.Carrier.ClientPortSpan,
+			"keepalive_s", c.Client.KeepAliveSeconds,
+			"reconnect_s", c.Client.ReconnectSeconds,
+		)
+	} else {
+		a = append(a,
+			"backend_ip", c.Server.BackendIP,
+			"allow_socks5", c.Server.AllowSocks5,
+			"allowed_ports", c.Server.AllowedPorts,
+		)
+	}
+	switch c.Transport {
+	case TransportKCP:
+		a = append(a,
+			"kcp_nodelay", c.KCP.NoDelay,
+			"kcp_interval", c.KCP.Interval,
+			"kcp_resend", c.KCP.Resend,
+			"kcp_nc", c.KCP.NC,
+			"kcp_sndwnd", c.KCP.SndWnd,
+			"kcp_rcvwnd", c.KCP.RcvWnd,
+			"kcp_fec", fmt.Sprintf("%d/%d", c.KCP.FECData, c.KCP.FECParity),
+			"kcp_stream_buffer", c.KCP.StreamBuffer,
+			"kcp_session_buffer", c.KCP.SessionBuffer,
+		)
+	case TransportQUIC:
+		a = append(a,
+			"quic_keepalive_period", c.QUIC.KeepAlivePeriod,
+			"quic_max_idle_timeout", c.QUIC.MaxIdleTimeout,
+		)
+	}
+	return a
+}
+
 // Load reads a YAML file over the defaults and validates it.
 func Load(path string) (Config, error) {
 	cfg := Default()

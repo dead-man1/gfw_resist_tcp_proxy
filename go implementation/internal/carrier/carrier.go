@@ -284,17 +284,6 @@ func Open(opts Options) (*Carrier, error) {
 // LocalIP reports the source IP used for crafted packets.
 func (c *Carrier) LocalIP() net.IP { return c.localIP }
 
-// Flags reports the TCP control bits crafted segments carry, for startup logs.
-func (c *Carrier) Flags() TCPFlags { return c.flags() }
-
-// SeqMode reports the active sequence-number mode, for startup logs.
-func (c *Carrier) SeqMode() SeqMode {
-	if c.seqMode == "" {
-		return SeqFixed
-	}
-	return c.seqMode
-}
-
 // RotateClientPort advances the client's carrier source port within its span so
 // the next reconnect looks like a fresh flow to the server, avoiding a stall
 // while the server's previous session for the old port times out. No-op on the

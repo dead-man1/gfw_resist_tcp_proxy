@@ -263,3 +263,26 @@ troubleshooting: that log identifies your users.
 enter VPS IP / shared key / transport / SOCKS5 / forwards (or Load a client.yaml),
 tick "Manage firewall", and Connect. It shows live connection status, up/down
 throughput, and a log pane. Run as Administrator.
+
+### The GUI honours the whole config file, not just its fields
+
+The window deliberately exposes only the handful of settings people change often.
+Everything else is still read from the YAML and applied on Connect:
+
+| in the window | file-only (no widget) |
+|---|---|
+| vps_ip, shared key, transport, mtu | carrier.interface, carrier.tcp_flags, carrier.seq_mode |
+| server_port + span, client_port + span | the whole `kcp:` and `quic:` blocks |
+| socks5_listen, forwards, manage firewall | client.keepalive_seconds, client.reconnect_seconds, log_level |
+
+So the normal flow works as expected: **Load** a config, change the VPS IP, hit
+**Connect** — your FEC settings, window sizes, `seq_mode`, NIC override and log
+level all still apply. Editing a field only overrides that field. **Save** writes
+the merged result back (as plain YAML — comments in the original file are lost).
+
+A `client.yaml` (or `gfk.yaml`) sitting next to the exe is loaded automatically at
+startup, so the file-only settings are in effect even before you press Load.
+
+To confirm what actually took effect, read the `settings in effect` line the log
+pane prints on Connect — it lists every file-only value. The CLI prints the same
+line at startup.

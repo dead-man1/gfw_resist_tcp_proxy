@@ -1,8 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/carrier"
 )
 
 // TestExampleConfigsValidate ensures the shipped example configs load and pass
@@ -94,6 +98,92 @@ func TestPacketShapeValidation(t *testing.T) {
 	c.Carrier.SeqMode = "random"
 	if err := c.Validate(); err == nil {
 		t.Error("seq_mode random should be refused")
+	}
+}
+
+// attrMap flattens EffectiveAttrs into a lookup, failing if the pairs are
+// malformed (slog would silently render a dangling key as "!BADKEY").
+func attrMap(t *testing.T, attrs []any) map[string]string {
+	t.Helper()
+	if len(attrs)%2 != 0 {
+		t.Fatalf("EffectiveAttrs returned %d items, want key/value pairs", len(attrs))
+	}
+	m := map[string]string{}
+	for i := 0; i < len(attrs); i += 2 {
+		k, ok := attrs[i].(string)
+		if !ok {
+			t.Fatalf("attr key %d is %T, want string", i, attrs[i])
+		}
+		if _, dup := m[k]; dup {
+			t.Errorf("duplicate attr key %q", k)
+		}
+		m[k] = fmt.Sprint(attrs[i+1])
+	}
+	return m
+}
+
+// TestEffectiveAttrs: this line is how a GUI user confirms that settings with no
+// widget were honoured, so it must cover them, report resolved values rather than
+// raw strings, and never carry the shared key.
+func TestEffectiveAttrs(t *testing.T) {
+	c := validServer()
+	c.Carrier.Interface = "eth1"
+	c.Carrier.TCPFlags = nil // omitted in the file => the ack+psh default
+	c.Carrier.SeqMode = ""   // ditto => fixed
+	c.KCP.SndWnd, c.KCP.FECData, c.KCP.FECParity = 512, 10, 3
+	c.Auth.Key = "a-secret-that-must-not-be-logged"
+
+	m := attrMap(t, c.EffectiveAttrs())
+	for _, k := range []string{"transport", "interface", "mtu", "server_port",
+		"server_port_span", "tcp_flags", "seq_mode", "log_level"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("missing attr %q", k)
+		}
+	}
+	if m["tcp_flags"] != "ack+psh" {
+		t.Errorf("tcp_flags = %q, want the resolved default ack+psh", m["tcp_flags"])
+	}
+	if m["seq_mode"] != string(carrier.SeqFixed) {
+		t.Errorf("seq_mode = %q, want the resolved default fixed", m["seq_mode"])
+	}
+	if m["interface"] != "eth1" || m["kcp_sndwnd"] != "512" || m["kcp_fec"] != "10/3" {
+		t.Errorf("file-only settings not reported: %v", m)
+	}
+	for k, v := range m {
+		if strings.Contains(v, "secret-that-must-not-be-logged") {
+			t.Errorf("attr %q leaks auth.key", k)
+		}
+	}
+
+	// The tuning block reported must match the selected transport.
+	if _, ok := m["quic_max_idle_timeout"]; ok {
+		t.Error("a kcp config should not report quic knobs")
+	}
+	c.Transport = TransportQUIC
+	m = attrMap(t, c.EffectiveAttrs())
+	if _, ok := m["quic_max_idle_timeout"]; !ok {
+		t.Error("a quic config should report quic knobs")
+	}
+	if _, ok := m["kcp_sndwnd"]; ok {
+		t.Error("a quic config should not report kcp knobs")
+	}
+
+	// Client mode reports the client-side timers instead of the server section.
+	cli := Default()
+	cli.Auth.Key = "k"
+	cli.Carrier.VPSIP = "203.0.113.10"
+	cli.Client.Forwards = []Forward{{Proto: "tcp", Listen: "127.0.0.1:14000", TargetPort: 443}}
+	if err := cli.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	m = attrMap(t, cli.EffectiveAttrs())
+	for _, k := range []string{"client_port", "client_port_span", "keepalive_s", "reconnect_s"} {
+		if _, ok := m[k]; !ok {
+			t.Errorf("client mode should report %q", k)
+		}
+	}
+	if _, ok := m["backend_ip"]; ok {
+		t.Error("client mode should not report the server section")
 	}
 }
 

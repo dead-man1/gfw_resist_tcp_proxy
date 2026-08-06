@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -132,6 +133,7 @@ func main() {
 	u := newUI(w)
 	w.SetContent(u.build())
 	w.Resize(fyne.NewSize(740, 720)) // fallback; applyStartSize refines it below
+	u.autoLoadConfig()               // after build(): it writes to the form widgets
 
 	if !isElevated() {
 		u.logger.Warn("not running as Administrator — raw sockets, Npcap and firewall changes will fail; restart elevated")
@@ -436,33 +438,71 @@ func (u *ui) syncLAN() {
 	u.lan.Refresh()
 }
 
-// buildConfig assembles and validates a client config from the form fields,
-// layered over the config the form was populated from.
-func (u *ui) buildConfig() (config.Config, error) {
-	cfg := u.base
+// formValues is the content of every setting this window actually exposes. The
+// window has fields for a deliberately small subset of the config; everything
+// else — kcp/quic tuning, interface, tcp_flags, seq_mode, the keepalive and
+// reconnect timers, log_level, the whole server section — has no widget and is
+// carried through from the loaded file untouched.
+type formValues struct {
+	transport string
+	vps       string
+	key       string
+	srvPort   string
+	srvSpan   string
+	cliPort   string
+	cliSpan   string
+	mtu       string
+	socks     string
+	forwards  string
+	firewall  bool
+}
+
+// overlayForm layers the window's fields onto the config the form was populated
+// from. Split out from buildConfig so the passthrough guarantee — edit the VPS
+// IP, keep every invisible setting — is testable without a display.
+func overlayForm(base config.Config, f formValues) (config.Config, error) {
+	cfg := base
 	cfg.Mode = config.ModeClient
-	cfg.Transport = config.Transport(u.trans.Selected)
-	cfg.Carrier.VPSIP = strings.TrimSpace(u.vps.Text)
-	cfg.Carrier.ServerPort = atou16(u.srvPort.Text, cfg.Carrier.ServerPort)
-	cfg.Carrier.ClientPort = atou16(u.cliPort.Text, cfg.Carrier.ClientPort)
-	cfg.Carrier.ServerPortSpan = atoiDef(u.srvSpan.Text, cfg.Carrier.ServerPortSpan)
-	cfg.Carrier.ClientPortSpan = atoiDef(u.cliSpan.Text, cfg.Carrier.ClientPortSpan)
-	if m, err := strconv.Atoi(strings.TrimSpace(u.mtu.Text)); err == nil {
+	cfg.Transport = config.Transport(f.transport)
+	cfg.Carrier.VPSIP = strings.TrimSpace(f.vps)
+	cfg.Carrier.ServerPort = atou16(f.srvPort, cfg.Carrier.ServerPort)
+	cfg.Carrier.ClientPort = atou16(f.cliPort, cfg.Carrier.ClientPort)
+	cfg.Carrier.ServerPortSpan = atoiDef(f.srvSpan, cfg.Carrier.ServerPortSpan)
+	cfg.Carrier.ClientPortSpan = atoiDef(f.cliSpan, cfg.Carrier.ClientPortSpan)
+	if m, err := strconv.Atoi(strings.TrimSpace(f.mtu)); err == nil {
 		cfg.Carrier.MTU = m
 	}
-	cfg.Auth.Key = u.key.Text
-	cfg.Client.Socks5Listen = strings.TrimSpace(u.socks.Text)
-	fws, err := parseForwards(u.forwards.Text)
+	cfg.Auth.Key = f.key
+	cfg.Client.Socks5Listen = strings.TrimSpace(f.socks)
+	fws, err := parseForwards(f.forwards)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.Client.Forwards = fws
-	if u.firewall.Checked {
+	if f.firewall {
 		cfg.Firewall.Manage = config.FirewallYes
 	} else {
 		cfg.Firewall.Manage = config.FirewallNo
 	}
 	return cfg, cfg.Validate()
+}
+
+// buildConfig assembles and validates a client config from the form fields,
+// layered over the config the form was populated from.
+func (u *ui) buildConfig() (config.Config, error) {
+	return overlayForm(u.base, formValues{
+		transport: u.trans.Selected,
+		vps:       u.vps.Text,
+		key:       u.key.Text,
+		srvPort:   u.srvPort.Text,
+		srvSpan:   u.srvSpan.Text,
+		cliPort:   u.cliPort.Text,
+		cliSpan:   u.cliSpan.Text,
+		mtu:       u.mtu.Text,
+		socks:     u.socks.Text,
+		forwards:  u.forwards.Text,
+		firewall:  u.firewall.Checked,
+	})
 }
 
 func (u *ui) applyConfig(cfg config.Config) {
@@ -482,6 +522,67 @@ func (u *ui) applyConfig(cfg config.Config) {
 	u.syncLAN()
 }
 
+// parseConfig decodes YAML config bytes over the defaults, exactly as the CLI's
+// config.Load does — so a key absent from the file keeps its default instead of
+// becoming a zero value.
+func parseConfig(raw []byte) (config.Config, error) {
+	cfg := config.Default()
+	err := yaml.Unmarshal(raw, &cfg)
+	return cfg, err
+}
+
+// applyRaw parses YAML config bytes and populates the form from the result.
+// Every key in the file lands in u.base, including the ones with no widget, so
+// Connect uses them even though they are invisible here.
+func (u *ui) applyRaw(raw []byte, path string) error {
+	cfg, err := parseConfig(raw)
+	if err != nil {
+		return err
+	}
+	u.cfgPath.SetText(path)
+	u.applyConfig(cfg)
+	u.logger.Info("config loaded", "path", path)
+	// Fields are populated either way; a bad file is a warning, not a stop.
+	if err := cfg.Validate(); err != nil {
+		u.logger.Warn("config needs fixing before connecting", "err", err)
+	}
+	return nil
+}
+
+// autoLoadConfig loads a config sitting next to the executable (or in the
+// working directory) at startup, mirroring what the CLI does when -config is
+// omitted. Without this, the settings that have no widget — kcp tuning,
+// tcp_flags, seq_mode, interface, log_level — would stay at their defaults until
+// the user thought to press Load. A missing file is normal: keep the defaults
+// and say nothing.
+func (u *ui) autoLoadConfig() {
+	for _, path := range autoConfigPaths() {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if err := u.applyRaw(raw, path); err != nil {
+			u.logger.Warn("ignoring unparseable config", "path", path, "err", err)
+			continue
+		}
+		return
+	}
+}
+
+// autoConfigPaths lists the files autoLoadConfig will try, in order: next to the
+// binary first (how the released zip is laid out), then the working directory.
+func autoConfigPaths() []string {
+	names := []string{"client.yaml", "gfk.yaml"}
+	var paths []string
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Dir(exe)
+		for _, n := range names {
+			paths = append(paths, filepath.Join(dir, n))
+		}
+	}
+	return append(paths, names...)
+}
+
 func (u *ui) loadConfig() {
 	d := dialog.NewFileOpen(func(rc fyne.URIReadCloser, err error) {
 		if err != nil {
@@ -497,18 +598,8 @@ func (u *ui) loadConfig() {
 			u.logger.Error("read config failed", "err", err)
 			return
 		}
-		cfg := config.Default()
-		if err := yaml.Unmarshal(raw, &cfg); err != nil {
+		if err := u.applyRaw(raw, localPath(rc.URI())); err != nil {
 			u.logger.Error("parse config failed", "err", err)
-			return
-		}
-		path := localPath(rc.URI())
-		u.cfgPath.SetText(path)
-		u.applyConfig(cfg)
-		u.logger.Info("config loaded", "path", path)
-		// Fields are populated either way; a bad file is a warning, not a stop.
-		if err := cfg.Validate(); err != nil {
-			u.logger.Warn("config needs fixing before connecting", "err", err)
 		}
 	}, u.win)
 	d.SetFilter(storage.NewExtensionFileFilter([]string{".yaml", ".yml"}))
@@ -663,6 +754,10 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 	if vpsIP == nil {
 		return nil, fmt.Errorf("invalid VPS IP %q", cfg.Carrier.VPSIP)
 	}
+	// Echo everything that took effect, including the many settings this window
+	// has no field for — they come from the loaded YAML, and this line is how a
+	// user confirms they were honoured.
+	logger.Info("settings in effect", cfg.EffectiveAttrs()...)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	span := cfg.Carrier.ClientPortSpan
@@ -700,8 +795,7 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		}
 		return nil, fmt.Errorf("carrier: %w", err)
 	}
-	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()),
-		"tcp_flags", car.Flags(), "seq_mode", car.SeqMode())
+	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()), "interface", cfg.Carrier.Interface)
 
 	params := transport.Params{
 		Transport:        cfg.Transport,

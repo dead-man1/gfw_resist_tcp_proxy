@@ -60,6 +60,7 @@ func main() {
 	}
 	logger := slog.New(handler)
 	logger.Info("config loaded", "path", *cfgPath)
+	logger.Info("settings in effect", cfg.EffectiveAttrs()...)
 
 	// vps_ip is required on the client; optional on the server (auto-derived).
 	var vpsIP net.IP
@@ -131,8 +132,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer car.Close()
-	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()), "interface", cfg.Carrier.Interface,
-		"tcp_flags", car.Flags(), "seq_mode", car.SeqMode())
+	// The flags/seq mode are already in the "settings in effect" line above; what
+	// is new here is the NIC gfk actually resolved.
+	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()), "interface", cfg.Carrier.Interface)
 
 	params := transport.Params{
 		Transport:        cfg.Transport,
