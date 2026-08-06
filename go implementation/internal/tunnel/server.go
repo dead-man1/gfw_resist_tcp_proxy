@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/config"
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/logx"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/transport"
 )
 
@@ -46,14 +47,15 @@ func (s *Server) Serve(ctx context.Context, lis transport.Listener) error {
 
 func (s *Server) handleSession(ctx context.Context, sess transport.Session) {
 	peer := sess.RemoteAddr()
-	s.log.Debug("client session up", "peer", peer)
+	// logx.Peer redacts the client address to what the active log level allows.
+	s.log.Debug("client session up", logx.Peer(peer))
 	var verified atomic.Bool // set once the client passes the authenticated hello
 	defer func() {
 		_ = sess.Close() // closes all streams; their goroutines and backend conns unwind
 		if verified.Load() {
-			s.log.Info("client disconnected", "peer", peer)
+			s.log.Info("client disconnected", logx.Peer(peer))
 		} else {
-			s.log.Debug("client session down", "peer", peer)
+			s.log.Debug("client session down", logx.Peer(peer))
 		}
 	}()
 	for {
@@ -81,7 +83,7 @@ func (s *Server) handleStream(ctx context.Context, st transport.Stream, peer net
 	// and report the now-verified client.
 	if req.Cmd == cmdHello {
 		if verified.CompareAndSwap(false, true) {
-			s.log.Info("new client connected", "peer", peer)
+			s.log.Info("new client connected", logx.Peer(peer))
 		}
 		_ = writeStatus(st, statusOK)
 		return

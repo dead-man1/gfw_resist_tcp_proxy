@@ -23,6 +23,7 @@ import (
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/carrier"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/config"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/firewall"
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/logx"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/supervisor"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/transport"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/tunnel"
@@ -50,7 +51,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: parseLevel(cfg.LogLevel)}))
+	// Validate() already rejected an unknown level, so this cannot fail here.
+	level, _ := logx.ParseLevel(cfg.LogLevel)
+	logx.SetLevel(level) // also sets how much of a peer address may be logged
+	var handler slog.Handler = slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
+	if level >= logx.LevelNone {
+		handler = slog.DiscardHandler // log_level: none — emit nothing at all
+	}
+	logger := slog.New(handler)
 	logger.Info("config loaded", "path", *cfgPath)
 
 	// vps_ip is required on the client; optional on the server (auto-derived).
@@ -115,13 +123,16 @@ func main() {
 		ClientPortSpan: cfg.Carrier.ClientPortSpan,
 		ServerPortSpan: cfg.Carrier.ServerPortSpan,
 		Interface:      cfg.Carrier.Interface,
+		TCPFlags:       cfg.Carrier.TCPFlags,
+		SeqMode:        cfg.Carrier.SeqMode,
 	})
 	if err != nil {
 		logger.Error("failed to open carrier", "err", err)
 		os.Exit(1)
 	}
 	defer car.Close()
-	logger.Info("carrier bound", "local_ip", car.LocalIP(), "interface", cfg.Carrier.Interface)
+	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()), "interface", cfg.Carrier.Interface,
+		"tcp_flags", car.Flags(), "seq_mode", car.SeqMode())
 
 	params := transport.Params{
 		Transport:        cfg.Transport,
@@ -167,12 +178,12 @@ func runClient(ctx context.Context, cfg config.Config, car *carrier.Carrier, par
 			_ = sess.Close()
 			return nil, err
 		}
-		logger.Info(string(cfg.Transport)+" tunnel established to server", "peer", remote)
+		logger.Info(string(cfg.Transport)+" tunnel established to server", logx.Peer(remote))
 		return sess, nil
 	}, delay, logger)
 	go sup.Run(ctx)
 
-	logger.Info("client starting", "transport", cfg.Transport, "vps", cfg.Carrier.VPSIP)
+	logger.Info("client starting", "transport", cfg.Transport, logx.Addr("vps", cfg.Carrier.VPSIP))
 	cl := tunnel.NewClient(cfg.Client, cfg.Auth.Key, sup, logger)
 	_ = cl.Run(ctx)
 }
@@ -234,17 +245,4 @@ func defaultConfigPath() string {
 		}
 	}
 	return ""
-}
-
-func parseLevel(s string) slog.Level {
-	switch strings.ToLower(s) {
-	case "debug":
-		return slog.LevelDebug
-	case "warn", "warning":
-		return slog.LevelWarn
-	case "error":
-		return slog.LevelError
-	default:
-		return slog.LevelInfo
-	}
 }

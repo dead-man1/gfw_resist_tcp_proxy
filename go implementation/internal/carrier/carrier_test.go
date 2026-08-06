@@ -60,7 +60,7 @@ func newTestServer(vpsIP net.IP, pio packetIO) *Carrier {
 // the transport would see from ReadFrom.
 func feedInbound(t *testing.T, c *Carrier, f *fakeIO, clientIP, addressedIP net.IP, payload string) net.Addr {
 	t.Helper()
-	pkt, err := craftSegment(clientIP, addressedIP, 40000, 45000, 1, 1, []byte(payload))
+	pkt, err := craftSegment(clientIP, addressedIP, 40000, 45000, 1, 1, DefaultTCPFlags(), []byte(payload))
 	if err != nil {
 		t.Fatalf("craftSegment: %v", err)
 	}
@@ -107,9 +107,10 @@ func TestServerAutoDerivesReplySource(t *testing.T) {
 	}
 }
 
-// TestCarrierConstantSeq: crafted packets must keep a constant, low TCP seq
-// regardless of payload size, so stateful NAT/conntrack never window-drops the
-// flow (the ~24s return-path death seen in the field).
+// TestCarrierConstantSeq: in the default seq_mode (fixed), crafted packets keep
+// a constant, low TCP seq regardless of payload size, so stateful NAT/conntrack
+// never window-drops the flow (the ~24s return-path death seen in the field).
+// seq_mode: realistic is covered in header_test.go.
 func TestCarrierConstantSeq(t *testing.T) {
 	f := newFakeIO()
 	c := newTestServer(nil, f)
@@ -178,7 +179,7 @@ func TestServerPortSpan(t *testing.T) {
 	addressed := net.IPv4(203, 0, 113, 9)
 
 	// client targets server port 45003 (inside the span) — must be accepted.
-	pkt, err := craftSegment(client, addressed, 40000, 45003, 1, 1, []byte("hi"))
+	pkt, err := craftSegment(client, addressed, 40000, 45003, 1, 1, DefaultTCPFlags(), []byte("hi"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +210,7 @@ func TestServerPortSpan(t *testing.T) {
 	}
 
 	// a port outside the span must be ignored.
-	pkt2, _ := craftSegment(client, addressed, 40000, 45100, 1, 1, []byte("nope"))
+	pkt2, _ := craftSegment(client, addressed, 40000, 45100, 1, 1, DefaultTCPFlags(), []byte("nope"))
 	f.inbound <- pkt2
 	_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, _, err := c.ReadFrom(buf); err == nil {

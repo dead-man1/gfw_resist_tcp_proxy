@@ -9,6 +9,9 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/carrier"
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/logx"
 )
 
 // Mode is client or server.
@@ -54,6 +57,9 @@ type Config struct {
 	Client ClientConfig `yaml:"client"`
 	Server ServerConfig `yaml:"server"`
 
+	// LogLevel is one of none|error|warn|info|debug (see logx.LevelNames).
+	// It also controls how much of a peer address is logged: debug prints it in
+	// full, info/warn/error mask the last two IPv4 octets, none logs nothing.
 	LogLevel string `yaml:"log_level"`
 }
 
@@ -84,6 +90,20 @@ type CarrierConfig struct {
 	// MTU is the maximum carrier payload (bytes placed in one TCP segment).
 	// The transport layer is told to stay under this to avoid IP fragmentation.
 	MTU int `yaml:"mtu"`
+	// TCPFlags are the TCP control bits set on every crafted carrier segment:
+	// any of ack, psh (push), urg, fin. Default [ack, psh] — what a real
+	// mid-stream data segment carries. syn and rst are refused: a SYN is the one
+	// packet the GFW checks against its IP blocklist, and a RST tears the flow
+	// down on every middlebox in the path. Set per side; the peer does not care
+	// which bits arrive.
+	TCPFlags []string `yaml:"tcp_flags"`
+	// SeqMode selects the TCP sequence numbers of crafted segments:
+	//   fixed     — seq = ack = 1 on every packet (default). Safest for
+	//               window-tracking NAT, but obvious to anyone reading a capture.
+	//   realistic — random ISN, seq advances by the payload length, ack follows
+	//               the peer, with a restart at the ISN instead of a 32-bit
+	//               overflow. Independent per side.
+	SeqMode string `yaml:"seq_mode"`
 }
 
 // FirewallConfig controls RST suppression.
@@ -166,6 +186,8 @@ func Default() Config {
 			ClientPortSpan: 8,
 			ServerPortSpan: 8,
 			MTU:            1400,
+			TCPFlags:       []string{"ack", "psh"},
+			SeqMode:        string(carrier.SeqFixed),
 		},
 		Firewall: FirewallConfig{Manage: FirewallAsk},
 		Auth:     AuthConfig{Key: "change-me"},
@@ -243,6 +265,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Carrier.MTU < 576 || c.Carrier.MTU > 1500 {
 		return fmt.Errorf("carrier.mtu must be between 576 and 1500, got %d", c.Carrier.MTU)
+	}
+	// The carrier package owns the vocabulary for these two, so it validates them.
+	if _, err := carrier.ParseTCPFlags(c.Carrier.TCPFlags); err != nil {
+		return fmt.Errorf("carrier.tcp_flags: %w", err)
+	}
+	if _, err := carrier.ParseSeqMode(c.Carrier.SeqMode); err != nil {
+		return fmt.Errorf("carrier.seq_mode: %w", err)
+	}
+	if _, err := logx.ParseLevel(c.LogLevel); err != nil {
+		return fmt.Errorf("log_level: %w", err)
 	}
 	if strings.TrimSpace(c.Auth.Key) == "" {
 		return fmt.Errorf("auth.key is required")

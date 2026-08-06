@@ -12,6 +12,17 @@ carrier:
   # (no client_port here: the server learns each client's real source port from packets)
   interface: ""           # auto-detect; set e.g. "eth0" if detection is wrong
   mtu: 1400               # max carrier payload; IP packet = mtu + 40
+  tcp_flags: [ack, psh]   # control bits on every carrier packet: any of ack, psh (push), urg, fin.
+                          # Default [ack, psh] = what a real mid-stream data segment carries.
+                          # syn and rst are REFUSED: a SYN is the one packet the GFW matches
+                          # against its IP blocklist, and a RST tears the flow down everywhere.
+                          # Need NOT match the client (each side only crafts its own packets).
+  seq_mode: fixed         # fixed | realistic — TCP sequence numbers on carrier packets.
+                          #   fixed:     seq = ack = 1 always. Safest with window-tracking NAT.
+                          #   realistic: random ISN per client, seq grows by the payload length,
+                          #              ack follows that client, restarting at the ISN instead
+                          #              of overflowing.
+                          # Need NOT match the client (neither side reads the other's numbers).
 
 firewall:
   manage: ask             # ask | yes | no  (use "yes" under systemd)
@@ -43,4 +54,9 @@ server:
   allow_socks5: false     # true = let clients dial arbitrary targets (SOCKS mode)
   allowed_ports: []       # restrict destination ports, e.g. [443, 2096, 2052]. Empty = any port.
 
+# none | error | warn | info | debug
+#   none  = log nothing at all: no client IP is ever written to the log
+#   error = failures only        warn = failures + warnings
+#   info  = normal operation, client IPs masked to their first two octets (140.170.*.*:443)
+#   debug = everything, client IPs in full — troubleshooting only; this log identifies your users
 log_level: info

@@ -32,6 +32,7 @@ import (
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/carrier"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/config"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/firewall"
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/logx"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/supervisor"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/transport"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/tunnel"
@@ -113,6 +114,12 @@ type ui struct {
 	logger *slog.Logger
 	logh   *uiLogHandler
 
+	// base is the config the form was last populated from (defaults, or the file
+	// loaded with Load). buildConfig starts from it, so settings with no widget
+	// here — tcp_flags, seq_mode, log_level, the kcp tuning — survive a Save
+	// instead of being reset to the defaults.
+	base config.Config
+
 	mu     sync.Mutex
 	eng    *engine
 	ticker chan struct{}
@@ -169,7 +176,7 @@ func (u *ui) applyStartSize() {
 
 func newUI(w fyne.Window) *ui {
 	d := config.Default()
-	u := &ui{win: w}
+	u := &ui{win: w, base: d}
 	u.cfgPath = entry("client.yaml")
 	u.vps = entry("")
 	u.key = widget.NewPasswordEntry()
@@ -201,7 +208,21 @@ func newUI(w fyne.Window) *ui {
 
 	u.logh = &uiLogHandler{level: slog.LevelInfo, append: u.appendLog}
 	u.logger = slog.New(u.logh)
+	u.applyLogLevel(d.LogLevel)
 	return u
+}
+
+// applyLogLevel sets the log pane's threshold and the peer-address redaction
+// policy from a config log_level value. An unusable value keeps the current
+// level rather than silencing the pane.
+func (u *ui) applyLogLevel(name string) {
+	level, err := logx.ParseLevel(name)
+	if err != nil {
+		u.logger.Warn("ignoring log_level", "err", err)
+		return
+	}
+	u.logh.level = level
+	logx.SetLevel(level)
 }
 
 func (u *ui) build() fyne.CanvasObject {
@@ -415,9 +436,10 @@ func (u *ui) syncLAN() {
 	u.lan.Refresh()
 }
 
-// buildConfig assembles and validates a client config from the form fields.
+// buildConfig assembles and validates a client config from the form fields,
+// layered over the config the form was populated from.
 func (u *ui) buildConfig() (config.Config, error) {
-	cfg := config.Default()
+	cfg := u.base
 	cfg.Mode = config.ModeClient
 	cfg.Transport = config.Transport(u.trans.Selected)
 	cfg.Carrier.VPSIP = strings.TrimSpace(u.vps.Text)
@@ -444,6 +466,8 @@ func (u *ui) buildConfig() (config.Config, error) {
 }
 
 func (u *ui) applyConfig(cfg config.Config) {
+	u.base = cfg
+	u.applyLogLevel(cfg.LogLevel)
 	u.vps.SetText(cfg.Carrier.VPSIP)
 	u.key.SetText(cfg.Auth.Key)
 	u.trans.SetSelected(string(cfg.Transport))
@@ -666,6 +690,8 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		ClientPortSpan: cfg.Carrier.ClientPortSpan,
 		ServerPortSpan: cfg.Carrier.ServerPortSpan,
 		Interface:      cfg.Carrier.Interface,
+		TCPFlags:       cfg.Carrier.TCPFlags,
+		SeqMode:        cfg.Carrier.SeqMode,
 	})
 	if err != nil {
 		cancel()
@@ -674,6 +700,8 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		}
 		return nil, fmt.Errorf("carrier: %w", err)
 	}
+	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()),
+		"tcp_flags", car.Flags(), "seq_mode", car.SeqMode())
 
 	params := transport.Params{
 		Transport:        cfg.Transport,
@@ -703,7 +731,7 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 			_ = sess.Close()
 			return nil, err
 		}
-		logger.Info(string(cfg.Transport)+" tunnel established to server", "peer", remote)
+		logger.Info(string(cfg.Transport)+" tunnel established to server", logx.Peer(remote))
 		return sess, nil
 	}, delay, logger)
 	sup.SetStateHook(onState)
@@ -798,6 +826,9 @@ func (h *uiLogHandler) Handle(_ context.Context, r slog.Record) error {
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%s %-5s %s", r.Time.Format("15:04:05"), r.Level.String(), r.Message)
 	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "" { // elided attr, e.g. a peer address hidden by the log level
+			return true
+		}
 		fmt.Fprintf(&sb, "  %s=%v", a.Key, a.Value.Any())
 		return true
 	})

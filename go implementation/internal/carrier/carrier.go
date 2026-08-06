@@ -2,6 +2,7 @@ package carrier
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -31,6 +32,14 @@ type Options struct {
 	ServerPortSpan int
 	Interface      string // NIC name; empty = auto-detect toward VPSIP
 	SnapLen        int    // capture length; defaults applied if 0
+	// TCPFlags names the control bits crafted segments carry, straight from
+	// config carrier.tcp_flags (ack|psh|urg|fin). Empty = ack+psh. Open parses
+	// and rejects syn/rst.
+	TCPFlags []string
+	// SeqMode is config carrier.seq_mode: "fixed" (seq/ack pinned to 1) or
+	// "realistic". Empty = fixed. Each side chooses independently — the peer
+	// never inspects these numbers.
+	SeqMode string
 }
 
 // rxPacket is one received carrier payload plus its source peer.
@@ -67,6 +76,16 @@ type Carrier struct {
 	// client addressed us at), so the server replies from that address.
 	learnedSrc sync.Map
 
+	// tcpFlags are the control bits put on crafted segments; seqMode selects how
+	// the sequence numbers evolve. Both are parsed once, in Open.
+	tcpFlags TCPFlags
+	seqMode  SeqMode
+	// clientSeq is the single sequence state of the client role; peerSeq holds one
+	// *seqState per client for the server role (addr string -> *seqState). Only
+	// used when seqMode is SeqRealistic.
+	clientSeq *seqState
+	peerSeq   sync.Map
+
 	bytesIn  atomic.Uint64
 	bytesOut atomic.Uint64
 
@@ -76,6 +95,100 @@ type Carrier struct {
 
 	rdMu         sync.Mutex
 	readDeadline time.Time
+}
+
+// seqState is the fake-TCP sequence bookkeeping for one flow in
+// seq_mode: realistic. It makes a capture of the carrier look like an
+// established connection: a random ISN, seq advancing by exactly the bytes
+// sent, and an ack that tracks what the peer sent.
+//
+// Overflow: a real stack lets seq wrap modulo 2^32 and both ends follow the
+// wrap. We cannot rely on that here — the peer ignores seq entirely, so nothing
+// re-synchronises after a wrap — and 4 GB of tunnel traffic reaches it in an
+// afternoon. Instead, when the next segment would carry seq past 2^32 we
+// restart the flow at its ISN. To the peer this is invisible (it never looks);
+// to a middlebox it looks like the flow it was tracking rolled over, which is
+// the same class of event as the reconnect it already tolerates.
+type seqState struct {
+	mu  sync.Mutex
+	isn uint32 // where this flow started, and where it restarts on overflow
+	seq uint32 // sequence number for the next byte we send
+	ack uint32 // what we ack: the peer's last seq + its payload length
+}
+
+func newSeqState() *seqState {
+	s := &seqState{}
+	s.reset()
+	return s
+}
+
+// reset restarts the flow with a fresh ISN. Called when the carrier 4-tuple
+// changes (port rotation on reconnect), because a new tuple is a new connection
+// as far as anything on the path is concerned.
+func (s *seqState) reset() {
+	isn := randomISN()
+	s.mu.Lock()
+	s.isn, s.seq, s.ack = isn, isn, carrierAck
+	s.mu.Unlock()
+}
+
+// next reserves n bytes of sequence space and returns the seq/ack pair for the
+// segment carrying them.
+func (s *seqState) next(n uint32) (seq, ack uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seq+n < s.seq { // would carry us past 2^32: restart at the ISN
+		s.seq = s.isn
+	}
+	seq, ack = s.seq, s.ack
+	s.seq += n
+	return seq, ack
+}
+
+// observe records an inbound segment so our next ack reflects it, the way a
+// receiver's would. Reordered packets can walk the ack backwards; that costs
+// nothing, since the peer never reads it and no retransmission logic hangs off
+// it (KCP/QUIC above us own reliability).
+func (s *seqState) observe(peerSeq uint32, payloadLen int) {
+	ack := peerSeq + uint32(payloadLen)
+	if ack == 0 {
+		ack = 1 // ack 0 does not occur in an established stream
+	}
+	s.mu.Lock()
+	s.ack = ack
+	s.mu.Unlock()
+}
+
+// randomISN picks an initial sequence number. RFC 6528 wants these
+// unpredictable; math/rand/v2 is seeded from the OS and is plenty, since nothing
+// security-relevant rests on it (the payload is encrypted by the transport).
+func randomISN() uint32 {
+	return rand.Uint32N(1 << 31) // stay in the low half: room to climb before a wrap
+}
+
+// seqFor returns the sequence state for a peer: the single client-side state, or
+// the server's per-client one, created on first use. It takes the addr rather
+// than a key string so the client — which has only one flow — never pays for
+// formatting one on the receive path.
+func (c *Carrier) seqFor(addr *Addr) *seqState {
+	if c.opts.Role == RoleClient {
+		return c.clientSeq
+	}
+	key := addr.String()
+	if v, ok := c.peerSeq.Load(key); ok {
+		return v.(*seqState)
+	}
+	actual, _ := c.peerSeq.LoadOrStore(key, newSeqState())
+	return actual.(*seqState)
+}
+
+// flags reports the control bits for crafted segments. The zero value means a
+// Carrier built without Open (tests), which gets the ACK+PSH default.
+func (c *Carrier) flags() TCPFlags {
+	if c.tcpFlags == (TCPFlags{}) {
+		return DefaultTCPFlags()
+	}
+	return c.tcpFlags
 }
 
 // packetIO is the platform-specific raw capture/inject backend.
@@ -97,12 +210,19 @@ func Open(opts Options) (*Carrier, error) {
 	if opts.Role == RoleClient && opts.VPSIP == nil {
 		return nil, fmt.Errorf("carrier: VPSIP is required for client role")
 	}
+	flags, err := ParseTCPFlags(opts.TCPFlags)
+	if err != nil {
+		return nil, fmt.Errorf("carrier: tcp_flags: %w", err)
+	}
+	seqMode, err := ParseSeqMode(opts.SeqMode)
+	if err != nil {
+		return nil, fmt.Errorf("carrier: seq_mode: %w", err)
+	}
 
 	// localIP selects the NIC to bind capture/inject to; on the client it is also
 	// the crafted source IP. On the server the reply source is VPSIP (override) or
 	// auto-derived per client, so localIP here only steers interface selection.
 	var localIP net.IP
-	var err error
 	switch {
 	case opts.Role == RoleClient:
 		localIP, err = localIPToward(opts.VPSIP)
@@ -143,16 +263,19 @@ func Open(opts Options) (*Carrier, error) {
 	}
 
 	c := &Carrier{
-		opts:    opts,
-		pio:     pio,
-		localIP: localIP,
-		rx:      make(chan rxPacket, 1024),
-		closed:  make(chan struct{}),
+		opts:     opts,
+		pio:      pio,
+		localIP:  localIP,
+		tcpFlags: flags,
+		seqMode:  seqMode,
+		rx:       make(chan rxPacket, 1024),
+		closed:   make(chan struct{}),
 	}
 	c.curClientPort.Store(uint32(opts.ClientPort))
 	c.curServerPort.Store(uint32(opts.ServerPort))
 	if opts.Role == RoleClient {
 		c.peer = &Addr{IP: opts.VPSIP, Port: opts.ServerPort}
+		c.clientSeq = newSeqState()
 	}
 	go c.recvLoop()
 	return c, nil
@@ -160,6 +283,17 @@ func Open(opts Options) (*Carrier, error) {
 
 // LocalIP reports the source IP used for crafted packets.
 func (c *Carrier) LocalIP() net.IP { return c.localIP }
+
+// Flags reports the TCP control bits crafted segments carry, for startup logs.
+func (c *Carrier) Flags() TCPFlags { return c.flags() }
+
+// SeqMode reports the active sequence-number mode, for startup logs.
+func (c *Carrier) SeqMode() SeqMode {
+	if c.seqMode == "" {
+		return SeqFixed
+	}
+	return c.seqMode
+}
 
 // RotateClientPort advances the client's carrier source port within its span so
 // the next reconnect looks like a fresh flow to the server, avoiding a stall
@@ -173,6 +307,7 @@ func (c *Carrier) RotateClientPort() uint16 {
 	base := uint32(c.opts.ClientPort)
 	next := base + (c.curClientPort.Load()-base+1)%uint32(c.opts.ClientPortSpan)
 	c.curClientPort.Store(next)
+	c.resetSeq()
 	return uint16(next)
 }
 
@@ -187,7 +322,17 @@ func (c *Carrier) RotateServerPort() uint16 {
 	base := uint32(c.opts.ServerPort)
 	next := base + (c.curServerPort.Load()-base+1)%uint32(c.opts.ServerPortSpan)
 	c.curServerPort.Store(next)
+	c.resetSeq()
 	return uint16(next)
+}
+
+// resetSeq starts a fresh sequence flow on the client after a port rotation: the
+// new 4-tuple is a new connection to every middlebox on the path, and a real
+// connection would open with a new ISN. No-op in fixed mode.
+func (c *Carrier) resetSeq() {
+	if c.seqMode == SeqRealistic && c.clientSeq != nil {
+		c.clientSeq.reset()
+	}
 }
 
 // usableSrcIP reports whether ip is a sane reply source address.
@@ -273,6 +418,12 @@ func (c *Carrier) recvLoop() {
 			}
 		}
 
+		// Mirror the peer's sequence number into our ack, so the numbers we craft
+		// stay consistent with the stream a middlebox is watching.
+		if c.seqMode == SeqRealistic {
+			c.seqFor(addr).observe(seg.seq, len(seg.payload))
+		}
+
 		payload := make([]byte, len(seg.payload))
 		copy(payload, seg.payload)
 		c.bytesIn.Add(uint64(len(payload)))
@@ -323,6 +474,7 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 
 	var srcIP, dstIP net.IP
 	var srcPort, dstPort uint16
+	var peer *Addr // server role: which client this reply is for
 	if c.opts.Role == RoleClient {
 		srcIP, srcPort = c.localIP, uint16(c.curClientPort.Load())
 		dstIP, dstPort = c.opts.VPSIP, uint16(c.curServerPort.Load())
@@ -331,7 +483,8 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 		if !ok {
 			return 0, fmt.Errorf("carrier: bad destination addr %v", addr)
 		}
-		key := (&Addr{IP: ip, Port: port}).String()
+		peer = &Addr{IP: ip, Port: port}
+		key := peer.String()
 		replyIP := c.opts.VPSIP        // IP override, if configured
 		replyPort := c.opts.ServerPort // fallback until we've learned the client's port
 		if v, found := c.learnedSrc.Load(key); found {
@@ -348,7 +501,11 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 		dstIP, dstPort = ip, port
 	}
 
-	ipPkt, err := craftSegment(srcIP, dstIP, srcPort, dstPort, carrierSeq, carrierAck, p)
+	seq, ack := uint32(carrierSeq), uint32(carrierAck)
+	if c.seqMode == SeqRealistic {
+		seq, ack = c.seqFor(peer).next(uint32(len(p)))
+	}
+	ipPkt, err := craftSegment(srcIP, dstIP, srcPort, dstPort, seq, ack, c.flags(), p)
 	if err != nil {
 		return 0, err
 	}

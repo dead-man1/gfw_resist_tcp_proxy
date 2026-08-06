@@ -10,6 +10,18 @@ carrier:
   client_port_span: 8     # rotate source port across N ports on reconnect (avoids session collision); 1 = off
   interface: ""           # auto-detect; set the NIC name if detection is wrong
   mtu: 1400               # must match the server
+  tcp_flags: [ack, psh]   # control bits on every carrier packet: any of ack, psh (push), urg, fin.
+                          # Default [ack, psh] = what a real mid-stream data segment carries.
+                          # syn and rst are REFUSED: a SYN is the one packet the GFW matches
+                          # against its IP blocklist, and a RST tears the flow down everywhere.
+                          # Independent of the server's setting (the peer ignores the bits).
+  seq_mode: fixed         # fixed | realistic — TCP sequence numbers on carrier packets.
+                          #   fixed:     seq = ack = 1 always. Safest with window-tracking NAT,
+                          #              but a capture makes the tunnel obvious.
+                          #   realistic: random ISN, seq grows by the payload length, ack follows
+                          #              the server, restarting at the ISN instead of overflowing.
+                          # Independent of the server's setting. Try realistic if you suspect
+                          # DPI on the numbers; go back to fixed if the link dies after ~24s.
 
 firewall:
   manage: ask             # ask | yes | no
@@ -51,4 +63,9 @@ client:
   keepalive_seconds: 4    # heartbeat; keeps the NAT pinhole open. Dead-peer detect ~= 2x this
   reconnect_seconds: 2    # delay between reconnect attempts
 
+# none | error | warn | info | debug
+#   none  = log nothing at all (no addresses can leak)
+#   error = failures only        warn = failures + warnings
+#   info  = normal operation, peer IPs masked to their first two octets (140.170.*.*:443)
+#   debug = everything, peer IPs in full — for troubleshooting, not for pasting in public
 log_level: info

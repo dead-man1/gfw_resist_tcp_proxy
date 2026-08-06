@@ -17,7 +17,13 @@ type ioParams struct {
 }
 
 // bpfFilter returns a libpcap-style filter selecting inbound carrier packets.
-// (Windows/libpcap uses it directly; Linux applies exact matching in userspace.)
+//
+// Nothing installs it today: both backends match in userspace (in the Carrier
+// receive loop), and the Windows pcap handle deliberately carries no filter so
+// resolveGatewayMAC can see ARP replies. If it is ever wired up, the port terms
+// must become ranges ("portrange a-b") — as written they pin the base ports,
+// which would blackhole everything after the first port rotation. See
+// ClientPortSpan / ServerPortSpan.
 func (p ioParams) bpfFilter() string {
 	if p.role == RoleClient {
 		return fmt.Sprintf("tcp and src host %s and src port %d and dst port %d",

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/logx"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/transport"
 )
 
@@ -105,7 +106,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		s.cond.Broadcast()
 		s.mu.Unlock()
 		s.setState(StateUp)
-		s.log.Debug("session up", "peer", sess.RemoteAddr())
+		s.log.Debug("session up", logx.Peer(sess.RemoteAddr()))
 
 		s.waitDead(ctx, sess)
 

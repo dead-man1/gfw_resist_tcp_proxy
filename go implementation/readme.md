@@ -162,6 +162,42 @@ Rotation (server can't signal a new port over a dead tunnel) is avoided in favou
 of a span: the server passively listens on the whole range, so no coordination is
 needed. The RST-suppression firewall auto-covers each side's full range.
 
+The two spans are **independent**, which is easy to misread in a packet capture:
+with `client_port_span: 2` and `server_port_span: 8` the client's *source* port
+only ever alternates between 40000 and 40001, while its *destination* port sweeps
+45000–45007. Eight ports on the wire, and `client_port_span` is still being
+honoured — it is the destination side you are watching.
+
+### Shaping the fake TCP packets (`tcp_flags`, `seq_mode`)
+
+Carrier packets are hand-crafted, so their TCP header is a policy choice:
+
+```yaml
+carrier:
+  tcp_flags: [ack, psh]   # any of ack, psh (push), urg, fin
+  seq_mode: fixed         # fixed | realistic
+```
+
+- `carrier.tcp_flags` — control bits on every crafted segment. Default
+  `[ack, psh]`, what a real mid-stream data segment carries. `syn` and `rst` are
+  **refused by config validation**: a SYN is the one packet the GFW matches
+  against its IP blocklist (sending one defeats the whole design), and a RST
+  tells every middlebox on the path to drop the flow. `psh`/`urg` are only set on
+  segments that actually carry payload, and `urg` also gets an urgent pointer, so
+  the header stays a combination a real stack could emit.
+- `carrier.seq_mode` — `fixed` (default) pins seq and ack to 1 on every packet.
+  That is maximally safe for window-tracking NAT, but a capture makes the tunnel
+  obvious. `realistic` starts from a random ISN, advances seq by the payload
+  length, and acks what the peer actually sent — the pair stays consistent the
+  way a real stream's does, and on reaching the 32-bit limit the flow restarts at
+  its ISN instead of wrapping (the peer never reads seq, so the restart is
+  invisible to it). Port rotation also starts a fresh ISN, since the new 4-tuple
+  is a new connection to everything on the path.
+
+Neither setting has to match on the other end — each side only crafts its own
+packets and ignores the peer's numbers and flags. If a link starts dying after
+~24 s on `realistic`, a window-tracking middlebox is unhappy: go back to `fixed`.
+
 ### Restricting destination ports (server)
 
 Set `server.allowed_ports` to limit which ports clients may reach (applies to
@@ -195,6 +231,25 @@ Set the same `nc` + window on **both** ends. For a lossy/adversarial link add
 `fec_data: 10` / `fec_parity: 3` (must match on both ends; ~30% bandwidth cost).
 Avoid `nc: 0` — kcp-go's congestion control underperforms badly over this carrier
 (collapses throughput). Bound bufferbloat with the window instead.
+
+### Logging and client privacy (`log_level`)
+
+`log_level` takes `none | error | warn | info | debug`, and it also decides how
+much of a peer address reaches the log — the server log is the one place a
+client's real IP appears:
+
+| level | what is logged | peer address |
+|---|---|---|
+| `none` | nothing at all | never printed |
+| `error` | failures | masked |
+| `warn` | failures + warnings | masked |
+| `info` (default) | normal operation | masked: `peer=140.170.*.*:443` |
+| `debug` | everything, incl. per-session detail | full: `peer=140.170.23.9:443` |
+
+Masking drops the last two IPv4 octets (the last six IPv6 groups), keeping enough
+to tell which network a client came from without identifying it. A hostname that
+is not an IP is replaced entirely with `*`. Use `debug` only while
+troubleshooting: that log identifies your users.
 
 ## Requirements
 
