@@ -57,7 +57,7 @@ jobs:
 
   # --- Windows GUI: needs cgo + a C toolchain (Fyne). Built natively. ---
   build-gui:
-    name: GUI gfk-gui.exe (windows/amd64)
+    name: GUI gfk-windows-GUI.exe (windows/amd64)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,11 +72,11 @@ jobs:
         env:
           CGO_ENABLED: "1"
         # -H windowsgui: no console window (the GUI has its own log pane).
-        run: go build -tags gui -trimpath -ldflags "-s -w -H windowsgui" -o dist/gfk-gui.exe ./cmd/gfk-gui
+        run: go build -tags gui -trimpath -ldflags "-s -w -H windowsgui" -o dist/gfk-windows-GUI.exe ./cmd/gfk-gui
       - uses: actions/upload-artifact@v4
         with:
-          name: gfk-gui.exe
-          path: "go implementation/dist/gfk-gui.exe"
+          name: gfk-windows-GUI.exe
+          path: "go implementation/dist/gfk-windows-GUI.exe"
           if-no-files-found: error
 
   # --- Collect all artifacts and publish the release ---

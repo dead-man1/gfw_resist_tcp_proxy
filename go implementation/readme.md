@@ -63,7 +63,7 @@ The **Windows GUI** (`cmd/gfk-gui`, Fyne) is built separately behind the `gui`
 build tag and needs cgo + a C compiler (mingw-w64):
 
 ```sh
-CGO_ENABLED=1 go build -tags gui -o gfk-gui.exe ./cmd/gfk-gui
+CGO_ENABLED=1 go build -tags gui -o gfk-windows-GUI.exe ./cmd/gfk-gui
 ```
 
 > Caveat: `go mod tidy` run *without* `-tags gui` will prune Fyne from `go.mod`
@@ -78,7 +78,7 @@ Trigger it from the **Actions** tab → **Release** → **Run workflow**, enteri
 
 - CLI (cgo-free, cross-compiled on one Linux runner): `gfk-linux-{amd64,arm64,armv7,386}`,
   `gfk-windows-{amd64,arm64}.exe`.
-- Windows GUI (native cgo build on a Windows runner): `gfk-gui.exe`.
+- Windows GUI (native cgo build on a Windows runner): `gfk-windows-GUI.exe`.
 - Config templates: `server.yaml`, `client.yaml` (copied from `config/*.example.yaml`).
 
 The `gfk.sh` installer pulls `gfk-linux-amd64` / `gfk-linux-arm64` from that release.
@@ -204,7 +204,7 @@ Avoid `nc: 0` — kcp-go's congestion control underperforms badly over this carr
 
 ## Windows GUI
 
-`gfk-gui.exe` is a single self-contained window (no runtime deps beyond Npcap):
+`gfk-windows-GUI.exe` is a single self-contained window (no runtime deps beyond Npcap):
 enter VPS IP / shared key / transport / SOCKS5 / forwards (or Load a client.yaml),
-tick "Manage firewall", and Connect. It shows live connection status, ↑↓
+tick "Manage firewall", and Connect. It shows live connection status, up/down
 throughput, and a log pane. Run as Administrator.

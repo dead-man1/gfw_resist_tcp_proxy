@@ -10,7 +10,7 @@ cli-windows:
 	CGO_ENABLED=0 GOOS=windows go build -o dist/gfk.exe ./cmd/gfk
 
 gui:
-	CGO_ENABLED=1 go build -tags gui -o dist/gfk-gui.exe ./cmd/gfk-gui
+	CGO_ENABLED=1 go build -tags gui -o dist/gfk-windows-GUI.exe ./cmd/gfk-gui
 
 test:
 	go test ./...

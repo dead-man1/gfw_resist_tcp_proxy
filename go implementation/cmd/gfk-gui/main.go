@@ -52,6 +52,26 @@ const maxLogLines = 400
 // startup, leaving the frame clear of the taskbar.
 const screenFraction = 0.88
 
+// Fixed widths for the status and rate cells flanking the Connect button. The
+// rate cell holds the widest reading ("▼ 1023.9 KB/s   ▲ 1023.9 KB/s") so a
+// right-aligned value never spills over the button.
+const (
+	statusCellWidth = 150
+	rateCellWidth   = 235
+)
+
+// Down/up markers for the transfer rate. Deliberately the Geometric Shapes
+// triangles, not the arrows U+2193/U+2191: Fyne resolves those two through the
+// emoji font and trails a literal U+FFFD replacement glyph after each one. These
+// come from the same block as the ●/○ status dots, which render clean.
+const (
+	glyphDown = "▼"
+	glyphUp   = "▲"
+)
+
+// rateIdle is the transfer-rate text shown while nothing is flowing.
+const rateIdle = glyphDown + " 0 B/s   " + glyphUp + " 0 B/s"
+
 // localAddr / lanAddr are swapped in the listen fields by the "allow LAN" check.
 const (
 	localAddr = "127.0.0.1"
@@ -170,7 +190,8 @@ func newUI(w fyne.Window) *ui {
 
 	u.status = canvas.NewText("○ disconnected", colGrey)
 	u.status.TextStyle = fyne.TextStyle{Bold: true}
-	u.rate = canvas.NewText("↓ 0 B/s   ↑ 0 B/s", colGrey)
+	u.rate = canvas.NewText(rateIdle, colGrey)
+	u.rate.Alignment = fyne.TextAlignTrailing // pin the reading to the window edge
 
 	u.logView = widget.NewRichText()
 	u.logView.Wrapping = fyne.TextWrapWord
@@ -202,17 +223,23 @@ func (u *ui) build() fyne.CanvasObject {
 	u.connectBtn = widget.NewButton("Connect", u.toggle)
 	u.connectBtn.Importance = widget.HighImportance
 
-	statusBar := container.NewHBox(u.status, widget.NewLabel("   "), u.rate)
+	// Status hugs the left edge, transfer rate the right, Connect stretches
+	// between them. Fixed-width cells keep the button from twitching as the
+	// readings change length; the padding is the gap either side of the button.
+	statusRow := container.NewBorder(nil, nil,
+		fixedCell(u.status, statusCellWidth), fixedCell(u.rate, rateCellWidth),
+		container.NewPadded(u.connectBtn))
 
 	// Settings scroll so they narrow gracefully; Connect + status stay pinned to
 	// the bottom of the top pane so they are reachable however it is sized. The
 	// theme override lets the whole block grey out while the tunnel runs.
-	checks := container.NewGridWithColumns(2, u.firewall, u.lan)
+	// Firewall check left, LAN check pushed out to the right edge.
+	checks := container.NewHBox(u.firewall, layout.NewSpacer(), u.lan)
 	settingsBox := container.NewVBox(form, checks)
 	u.settingsTheme = container.NewThemeOverride(settingsBox, gfkTheme{Theme: theme.DefaultTheme()})
 	settings := container.NewVScroll(u.settingsTheme)
 	settings.SetMinSize(fyne.NewSize(0, 120))
-	controls := container.NewVBox(widget.NewSeparator(), u.connectBtn, statusBar)
+	controls := container.NewVBox(widget.NewSeparator(), statusRow)
 	topPane := container.NewBorder(nil, controls, nil, nil, settings)
 	u.naturalTop = settingsBox.MinSize().Height + controls.MinSize().Height + 4*theme.Padding()
 
@@ -229,6 +256,13 @@ func (u *ui) build() fyne.CanvasObject {
 	u.split = container.NewVSplit(topPane, logPane)
 	u.split.SetOffset(0.74)
 	return u.split
+}
+
+// fixedCell centres a text at a fixed width, so neighbours keep their geometry
+// when its content changes length.
+func fixedCell(txt *canvas.Text, width float32) fyne.CanvasObject {
+	sized := container.New(layout.NewGridWrapLayout(fyne.NewSize(width, txt.MinSize().Height)), txt)
+	return container.NewCenter(sized)
 }
 
 // trailingField puts a second, narrow labelled field on the right of a form row
@@ -298,7 +332,7 @@ func (u *ui) disconnect() {
 		u.setInputs(true)
 		u.connectBtn.SetText("Connect")
 		u.setStatusText("○ disconnected", colGrey)
-		u.rate.Text = "↓ 0 B/s   ↑ 0 B/s"
+		u.rate.Text = rateIdle
 		u.rate.Color = colGrey
 		u.rate.Refresh()
 	})
@@ -316,7 +350,7 @@ func (u *ui) pollRate(car *carrier.Carrier, stop chan struct{}) {
 			in, out := car.Stats()
 			di, do := in-lastIn, out-lastOut
 			lastIn, lastOut = in, out
-			txt := fmt.Sprintf("↓ %s/s   ↑ %s/s", humanBytes(di), humanBytes(do))
+			txt := fmt.Sprintf("%s %s/s   %s %s/s", glyphDown, humanBytes(di), glyphUp, humanBytes(do))
 			fyne.Do(func() {
 				u.rate.Text = txt
 				u.rate.Color = colGreen
