@@ -393,6 +393,16 @@ enter VPS IP / shared key / transport / SOCKS5 / forwards (or Load a client.yaml
 tick "Manage firewall", and Connect. It shows live connection status, up/down
 throughput, and a log pane. Run as Administrator.
 
+The log pane is **selectable**: drag to select, right-click for Copy / Select all,
+or Ctrl+C. The Copy button still grabs the whole log in one click. It renders in a
+monospace font, which is also what makes the startup banner line up — the banner is
+centred with spaces, so it only looks centred when every glyph is the same width.
+Long lines are not wrapped (the pane scrolls sideways instead), so a wide
+`settings in effect` line stays on one line and the banner keeps its shape on a
+narrow window. The trade-off for selectable text is that Fyne's editable widget
+carries a single colour for all of it, so log lines are no longer tinted by level —
+each line still names its level as text (`15:04:05 WARN  msg=...`).
+
 ### The GUI honours the whole config file, not just its fields
 
 The window deliberately exposes only the handful of settings people change often.

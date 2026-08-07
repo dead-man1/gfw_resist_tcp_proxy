@@ -103,7 +103,8 @@ type ui struct {
 	connectBtn *widget.Button
 	status     *canvas.Text
 	rate       *canvas.Text
-	logView    *widget.RichText
+	logView    *widget.Entry
+	logLines   []string
 	logScroll  *container.Scroll
 	autoScroll *widget.Check
 
@@ -130,7 +131,7 @@ type ui struct {
 func main() {
 	a := app.NewWithID("org.gfwknocker.gfk")
 	a.Settings().SetTheme(gfkTheme{Theme: theme.DefaultTheme()})
-	w := a.NewWindow("gfk — GFW Knocker " + version.Version)
+	w := a.NewWindow(version.Title())
 	u := newUI(w)
 	w.SetContent(u.build())
 	w.Resize(fyne.NewSize(740, 720)) // fallback; applyStartSize refines it below
@@ -207,9 +208,22 @@ func newUI(w fyne.Window) *ui {
 	u.rate = canvas.NewText(rateIdle, colGrey)
 	u.rate.Alignment = fyne.TextAlignTrailing // pin the reading to the window edge
 
-	u.logView = widget.NewRichText()
-	u.logView.Wrapping = fyne.TextWrapWord
-	u.logScroll = container.NewVScroll(u.logView)
+	// A disabled multi-line Entry, not a RichText: Entry is the only Fyne widget
+	// whose text can be selected with the mouse and copied (right-click offers
+	// Copy / Select all, and Ctrl+C works). Disabled makes it read-only while
+	// leaving selection intact.
+	//
+	// Monospace is not cosmetic here: the startup banner is centred with spaces,
+	// which only lines up when every glyph is the same width. Wrapping is off (with
+	// the entry's own scrolling off, so the outer container scrolls both axes) —
+	// wrapping would break the banner box on a narrow window and split long
+	// key=value log lines mid-value.
+	u.logView = widget.NewMultiLineEntry()
+	u.logView.TextStyle = fyne.TextStyle{Monospace: true}
+	u.logView.Wrapping = fyne.TextWrapOff
+	u.logView.Scroll = fyne.ScrollNone
+	u.logView.Disable()
+	u.logScroll = container.NewScroll(u.logView)
 	u.autoScroll = widget.NewCheck("Auto-scroll", nil)
 	u.autoScroll.SetChecked(true)
 
@@ -293,7 +307,9 @@ func (u *ui) build() fyne.CanvasObject {
 		widget.NewButtonWithIcon("Copy", theme.ContentCopyIcon(), u.copyLog),
 		widget.NewButtonWithIcon("Clear", theme.ContentClearIcon(), u.clearLog),
 	)
-	logPane := container.NewBorder(logBar, nil, nil, nil, u.logScroll)
+	// The theme override keeps the log at full contrast — see logTheme.
+	logPane := container.NewBorder(logBar, nil, nil, nil,
+		container.NewThemeOverride(u.logScroll, logTheme{Theme: gfkTheme{Theme: theme.DefaultTheme()}}))
 
 	// Draggable divider: the log area is flexible and user-adjustable.
 	u.split = container.NewVSplit(topPane, logPane)
@@ -690,45 +706,32 @@ func localPath(u fyne.URI) string {
 // appendLog adds one already-formatted record to the log pane. Must run on the
 // Fyne goroutine.
 func (u *ui) appendLog(level slog.Level, line string) {
-	seg := &widget.TextSegment{Text: line, Style: widget.RichTextStyle{ColorName: logColorName(level)}}
-	u.logView.Segments = append(u.logView.Segments, seg)
-	if n := len(u.logView.Segments); n > maxLogLines {
-		u.logView.Segments = append([]widget.RichTextSegment(nil), u.logView.Segments[n-maxLogLines:]...)
+	// The level is not used for colour: an Entry has one style for all its text,
+	// which is the price of making the log selectable. Nothing is lost — every
+	// line already carries its level as text ("15:04:05 WARN  msg=...").
+	u.logLines = append(u.logLines, line)
+	if n := len(u.logLines); n > maxLogLines {
+		u.logLines = append([]string(nil), u.logLines[n-maxLogLines:]...)
 	}
-	u.logView.Refresh()
+	u.logView.SetText(strings.Join(u.logLines, "\n"))
 	if u.autoScroll.Checked {
 		u.logScroll.ScrollToBottom()
 	}
 }
 
-func logColorName(level slog.Level) fyne.ThemeColorName {
-	switch {
-	case level >= slog.LevelError:
-		return theme.ColorNameError
-	case level >= slog.LevelWarn:
-		return theme.ColorNameWarning
-	case level < slog.LevelInfo:
-		return theme.ColorNameDisabled
-	default:
-		return theme.ColorNameForeground
-	}
-}
-
 func (u *ui) clearLog() {
-	u.logView.Segments = nil
-	u.logView.Refresh()
+	u.logLines = nil
+	u.logView.SetText("")
 	u.logScroll.Refresh()
 	// Keep the banner heading the pane. It also means a log copied out after a
 	// Clear still says which version produced it.
 	u.showBanner()
 }
 
+// copyLog copies the whole pane. Selecting a portion and using right-click →
+// Copy (or Ctrl+C) works too; this button is the shortcut for "all of it".
 func (u *ui) copyLog() {
-	lines := make([]string, 0, len(u.logView.Segments))
-	for _, s := range u.logView.Segments {
-		lines = append(lines, s.Textual())
-	}
-	fyne.CurrentApp().Clipboard().SetContent(strings.Join(lines, "\n"))
+	fyne.CurrentApp().Clipboard().SetContent(strings.Join(u.logLines, "\n"))
 }
 
 // gfkTheme keeps disabled text legible — Fyne's default disabled grey is nearly
@@ -740,6 +743,24 @@ type gfkTheme struct {
 	fyne.Theme
 
 	dimInputs bool
+}
+
+// logTheme keeps the log pane readable. That pane is a *disabled* Entry — the
+// only Fyne widget whose text can be selected and copied — and Fyne paints a
+// disabled widget's text in ColorNameDisabled, which gfkTheme deliberately dims
+// for the greyed-out settings block. Mapping it back to the foreground colour for
+// this subtree alone restores full contrast. The entry's border reads the same
+// theme name, so the pane also picks up a thin frame; that is the visible cost of
+// making the log selectable.
+type logTheme struct {
+	fyne.Theme
+}
+
+func (t logTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {
+	if n == theme.ColorNameDisabled {
+		return t.Theme.Color(theme.ColorNameForeground, v)
+	}
+	return t.Theme.Color(n, v)
 }
 
 func (t gfkTheme) Color(n fyne.ThemeColorName, v fyne.ThemeVariant) color.Color {

@@ -15,6 +15,18 @@ func TestString(t *testing.T) {
 	}
 }
 
+// TestTitle pins the desktop window title: "GFW-Knocker - gfk tunnel v2.0".
+func TestTitle(t *testing.T) {
+	if got, want := Title(), Org+" - "+String(); got != want {
+		t.Errorf("Title() = %q, want %q", got, want)
+	}
+	for _, part := range []string{Org, Name, Version} {
+		if !strings.Contains(Title(), part) {
+			t.Errorf("Title() = %q, missing %q", Title(), part)
+		}
+	}
+}
+
 // TestBannerShape: the banner must be a closed box — rules top and bottom, every
 // line inside no wider than the rule.
 func TestBannerShape(t *testing.T) {

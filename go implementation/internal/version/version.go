@@ -12,6 +12,8 @@ import (
 )
 
 const (
+	// Org is the project/author name, shown ahead of the product in window titles.
+	Org = "GFW-Knocker"
 	// Name is the product name as it appears to users.
 	Name = "gfk tunnel"
 	// Version is the release. Bump this for a release; that is the only edit a
@@ -29,6 +31,9 @@ const rule = "="
 // String is the short identity, e.g. "gfk tunnel v2.0". Use it in log attributes
 // and anywhere a single line is wanted.
 func String() string { return Name + " " + Version }
+
+// Title is the desktop window title, e.g. "GFW-Knocker - gfk tunnel v2.0".
+func Title() string { return Org + " - " + String() }
 
 // Banner returns the multi-line startup banner, without a trailing newline:
 //
