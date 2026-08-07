@@ -27,19 +27,28 @@ import (
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/supervisor"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/transport"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/tunnel"
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/version"
 )
 
 func main() {
 	cfgPath := flag.String("config", "", "path to YAML config file")
 	dropRST := flag.Bool("dropRST", false, "apply firewall RST-suppression rules without prompting")
 	dropRSTlc := flag.Bool("droprst", false, "alias for -dropRST")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	// Answered before anything else, so it works with no config present.
+	if *showVersion {
+		fmt.Println(version.Banner())
+		return
+	}
 
 	if *cfgPath == "" {
 		*cfgPath = defaultConfigPath() // look for a config next to the binary
 	}
 	if *cfgPath == "" {
-		fmt.Fprintln(os.Stderr, "usage: gfk -config <file.yaml> [-dropRST]")
+		fmt.Fprintln(os.Stderr, version.Banner())
+		fmt.Fprintln(os.Stderr, "usage: gfk -config <file.yaml> [-dropRST] [-version]")
 		fmt.Fprintln(os.Stderr, "  (or place server.yaml / client.yaml next to the gfk binary)")
 		os.Exit(2)
 	}
@@ -59,6 +68,16 @@ func main() {
 		handler = slog.DiscardHandler // log_level: none — emit nothing at all
 	}
 	logger := slog.New(handler)
+
+	// The banner goes straight to stderr rather than through the logger: it is the
+	// program identifying itself, not a log record, and slog would prefix every
+	// line with a timestamp and level. It is suppressed at log_level: none — on a
+	// VPS that output is usually captured by journald, and an operator who asked
+	// for silence should not find the dedication line persisted in a system log.
+	if level < logx.LevelNone {
+		fmt.Fprintln(os.Stderr, version.Banner())
+	}
+
 	logger.Info("config loaded", "path", *cfgPath)
 	logger.Info("settings in effect", cfg.EffectiveAttrs()...)
 

@@ -37,6 +37,7 @@ import (
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/supervisor"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/transport"
 	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/tunnel"
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/version"
 )
 
 var (
@@ -129,11 +130,15 @@ type ui struct {
 func main() {
 	a := app.NewWithID("org.gfwknocker.gfk")
 	a.Settings().SetTheme(gfkTheme{Theme: theme.DefaultTheme()})
-	w := a.NewWindow("gfk — GFW Knocker")
+	w := a.NewWindow("gfk — GFW Knocker " + version.Version)
 	u := newUI(w)
 	w.SetContent(u.build())
 	w.Resize(fyne.NewSize(740, 720)) // fallback; applyStartSize refines it below
-	u.autoLoadConfig()               // after build(): it writes to the form widgets
+
+	// Banner first, so it heads the log pane above every message. It goes in before
+	// autoLoadConfig, which is itself the first thing that logs.
+	u.showBanner()
+	u.autoLoadConfig() // after build(): it writes to the form widgets
 
 	if !isElevated() {
 		u.logger.Warn("not running as Administrator — raw sockets, Npcap and firewall changes will fail; restart elevated")
@@ -212,6 +217,21 @@ func newUI(w fyne.Window) *ui {
 	u.logger = slog.New(u.logh)
 	u.applyLogLevel(d.LogLevel)
 	return u
+}
+
+// showBanner puts the startup banner at the top of the log pane, ahead of any log
+// message. It writes to the pane directly rather than through the logger: it is
+// the program identifying itself, so it carries no timestamp or level, and it must
+// not be filtered out by log_level. Unlike the CLI's banner there is no risk of it
+// landing in a system log — this pane lives and dies with the window.
+func (u *ui) showBanner() { bannerTo(u.appendLog) }
+
+// bannerTo emits the banner through an arbitrary appender. Split out from
+// showBanner so its content and ordering are testable without a display.
+func bannerTo(append func(slog.Level, string)) {
+	for _, line := range version.BannerLines() {
+		append(slog.LevelInfo, line) // LevelInfo = plain foreground colour
+	}
 }
 
 // applyLogLevel sets the log pane's threshold and the peer-address redaction
@@ -698,6 +718,9 @@ func (u *ui) clearLog() {
 	u.logView.Segments = nil
 	u.logView.Refresh()
 	u.logScroll.Refresh()
+	// Keep the banner heading the pane. It also means a log copied out after a
+	// Clear still says which version produced it.
+	u.showBanner()
 }
 
 func (u *ui) copyLog() {

@@ -70,6 +70,31 @@ CGO_ENABLED=1 go build -tags gui -o gfk-windows-GUI.exe ./cmd/gfk-gui
 > (it's only imported under that tag). If that happens, `go get fyne.io/fyne/v2`
 > to restore it. The `gui` tag keeps Fyne entirely out of the cgo-free CLI build.
 
+## Version and banner
+
+Both front-ends print an identity banner at startup — the CLI to stderr, the GUI at
+the top of its log pane:
+
+```
+====================================================
+                  gfk tunnel v2.0
+https://github.com/GFW-knocker/gfw_resist_tcp_proxy/
+              in memory of Mahsa-Amini
+====================================================
+```
+
+Everything in it lives in [`internal/version/version.go`](internal/version/version.go)
+and nowhere else. **To cut a release, change `Version` there and stop** — the banner
+measures its own rules and re-centres its lines, so the box stays square whatever
+the strings become (including a non-ASCII dedication; it counts runes, not bytes).
+`gfk -version` prints the banner and exits.
+
+Two deliberate details: the CLI banner is **suppressed at `log_level: none`**,
+because on a VPS stderr usually lands in journald and an operator who asked for
+silence should not find the dedication line persisted in a system log; the GUI
+banner always shows, since that pane lives and dies with the window. Clearing the
+GUI log re-prints it, so a copied log always says which version produced it.
+
 ## Releasing (CI)
 
 `.github/workflows/release.yml` builds everything and publishes a GitHub Release.
