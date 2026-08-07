@@ -273,6 +273,42 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 	}
 }
 
+// TestRandomISNCoversTheFullRange: an ISN must be uniform over all 32 bits. A
+// restricted range is invisible in one flow but a fingerprint across many — an
+// earlier version drew from the low half only, so no flow ever set the top bit,
+// which no real stack does. Checked statistically: over 4096 draws the top bit
+// should be set roughly half the time, and the values should spread across all
+// four quarters of the space.
+func TestRandomISNCoversTheFullRange(t *testing.T) {
+	const draws = 4096
+	var topBitSet int
+	quarters := map[uint32]int{}
+	for i := 0; i < draws; i++ {
+		isn := randomISN()
+		if isn == 0 {
+			t.Fatal("ISN 0 must never be produced")
+		}
+		if isn&0x80000000 != 0 {
+			topBitSet++
+		}
+		quarters[isn>>30]++
+	}
+
+	// Binomial(4096, 0.5) has sd 32; +/-8 sd is 1728..2368. A range-restricted
+	// generator lands at 0 or 4096, so this is a wide margin around a huge signal.
+	if topBitSet < 1728 || topBitSet > 2368 {
+		t.Errorf("top bit set in %d of %d ISNs; want ~half — the range looks restricted", topBitSet, draws)
+	}
+	if len(quarters) != 4 {
+		t.Errorf("ISNs only landed in %d of the 4 quarters of the sequence space: %v", len(quarters), quarters)
+	}
+	for q, n := range quarters {
+		if n < draws/8 {
+			t.Errorf("quarter %d got only %d of %d draws; want ~%d", q, n, draws, draws/4)
+		}
+	}
+}
+
 // TestSeqWrapsLikeRealTCP: at 2^32 the sequence rolls over and the stream carries
 // on, exactly as TCP defines it — 4.29 GB into a transfer is not a reason to
 // disturb the flow. The crucial property is the SECOND assertion group: measured

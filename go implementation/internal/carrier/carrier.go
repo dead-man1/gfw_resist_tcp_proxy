@@ -232,9 +232,17 @@ func (s *seqState) observe(peerSeq uint32, payloadLen int, peerTS uint32, hasTS 
 // unpredictable; math/rand/v2 is seeded from the OS and is plenty, since nothing
 // security-relevant rests on it (the payload is encrypted by the transport).
 func randomISN() uint32 {
-	// Stay in the low half: room to climb before a wrap. Never 0 — a real stream
-	// does not sit at sequence 0, and it is the one value that would look planted.
-	return 1 + rand.Uint32N(1<<31)
+	// Uniform across the whole 32-bit space, as RFC 6528 intends. An earlier
+	// version drew from the low half only, to leave room to climb before a wrap;
+	// the wrap now needs no room (see seqState), and a restricted range is a
+	// fingerprint — invisible in any single flow, but a fleet of flows whose ISNs
+	// never set the top bit is not something a real stack produces.
+	if isn := rand.Uint32(); isn != 0 {
+		return isn
+	}
+	// 1 in 2^32. A real stream does not sit at sequence 0, and it is the one value
+	// that would look planted.
+	return 1
 }
 
 // checkPeerSeqMode warns once if the peer is evidently running seq_mode: fixed

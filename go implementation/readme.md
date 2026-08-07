@@ -70,30 +70,6 @@ CGO_ENABLED=1 go build -tags gui -o gfk-windows-GUI.exe ./cmd/gfk-gui
 > (it's only imported under that tag). If that happens, `go get fyne.io/fyne/v2`
 > to restore it. The `gui` tag keeps Fyne entirely out of the cgo-free CLI build.
 
-## Version and banner
-
-Both front-ends print an identity banner at startup — the CLI to stderr, the GUI at
-the top of its log pane:
-
-```
-====================================================
-                  gfk tunnel v2.0
-https://github.com/GFW-knocker/gfw_resist_tcp_proxy/
-              in memory of Mahsa-Amini
-====================================================
-```
-
-Everything in it lives in [`internal/version/version.go`](internal/version/version.go)
-and nowhere else. **To cut a release, change `Version` there and stop** — the banner
-measures its own rules and re-centres its lines, so the box stays square whatever
-the strings become (including a non-ASCII dedication; it counts runes, not bytes).
-`gfk -version` prints the banner and exits.
-
-Two deliberate details: the CLI banner is **suppressed at `log_level: none`**,
-because on a VPS stderr usually lands in journald and an operator who asked for
-silence should not find the dedication line persisted in a system log; the GUI
-banner always shows, since that pane lives and dies with the window. Clearing the
-GUI log re-prints it, so a copied log always says which version produced it.
 
 ## Releasing (CI)
 
@@ -193,162 +169,6 @@ only ever alternates between 40000 and 40001, while its *destination* port sweep
 45000–45007. Eight ports on the wire, and `client_port_span` is still being
 honoured — it is the destination side you are watching.
 
-### Shaping the fake TCP packets (`tcp_flags`, `seq_mode`)
-
-Carrier packets are hand-crafted, so their TCP header is a policy choice:
-
-```yaml
-carrier:
-  tcp_flags: [ack, psh]   # any of ack, psh (push), urg, fin
-  seq_mode: fixed         # fixed | realistic
-```
-
-- `carrier.tcp_flags` — control bits on every crafted segment. Default
-  `[ack, psh]`, what a real mid-stream data segment carries. `syn` and `rst` are
-  **refused by config validation**: a SYN is the one packet the GFW matches
-  against its IP blocklist (sending one defeats the whole design), and a RST
-  tells every middlebox on the path to drop the flow. `psh`/`urg` are only set on
-  segments that actually carry payload, and `urg` also gets an urgent pointer, so
-  the header stays a combination a real stack could emit.
-- `carrier.seq_mode` — `fixed` (default) pins seq and ack to 1 on every packet.
-  That is maximally safe for window-tracking NAT, but a capture makes the tunnel
-  obvious. `realistic` makes **both** numbers behave like an established
-  connection:
-  - **seq** starts at a random ISN and advances by exactly the bytes sent. Past
-    4.29 GB it **rolls over modulo 2³² and the stream carries on**, which is what
-    TCP has always done and what every middlebox expects: sequence comparisons use
-    serial arithmetic (RFC 1982 — Linux's `before()`/`after()` are
-    `(int32)(a-b) < 0`), for which the rollover is just the next small forward
-    step. The ack follows the peer through its own rollover the same way.
-  - **ack** starts at its own random, plausible position — there is no SYN-ACK to
-    learn the peer's real ISN from, and an ack of `1` would be the same giveaway
-    as a seq of `1`. The first packet from the peer replaces the guess with the
-    truth, and from then on the ack only ever moves forward, exactly like a real
-    cumulative ack (a reordered or retransmitted segment cannot pull it back).
-  - **window** jitters within `[64800, 65535]` instead of being the same value on
-    every packet. The band is deliberately narrow: this field is also what a
-    stateful middlebox uses as the ceiling for the *peer's* sequence numbers
-    (conntrack's `td_maxend = our_ack + our_window`), and with no SYN there is no
-    window scale to negotiate, so 65535 is a hard maximum and every byte shaved
-    off is a byte less of the peer's data allowed in flight. ~1% jitter breaks the
-    constant-value signature without trading away robustness.
-  - **RFC 7323 timestamps** are added — `NOP, NOP, TS` (12 bytes), byte for byte
-    the option block Linux and Windows put on established-connection segments. A
-    bare 20-byte header mid-stream is itself a signature. TSval is a per-flow
-    random base over a 1 ms clock (as Linux offsets each connection); TSecr echoes
-    the peer's clock, following the same guess-then-truth-then-forward-only rule as
-    the ack. A peer that sends no timestamps is tolerated.
-  - Port rotation starts a fresh ISN, a fresh ack guess and a fresh timestamp base,
-    since the new 4-tuple is a new connection to everything on the path.
-  - The 12 option bytes come **out of the payload budget**, not on top of it, so
-    the IP packet is `mtu + 40` in both modes and switching cannot push a
-    path-MTU-limited link over the edge. The startup log shows both figures
-    (`mtu=1400 transport_mtu=1388`).
-
-  A dump of a live `realistic` flow (client side), before and after the server
-  first speaks:
-
-      seq=713228218 ack=871834161  win=65244 tsval=751858357 tsecr=417278681 len=5
-      seq=713228223 ack=871834161  win=65009 tsval=751858357 tsecr=417278681 len=14
-      ... server sends 40 bytes at seq 3221225472, tsval 918273645 ...
-      seq=713228237 ack=3221225512 win=64847 tsval=751858357 tsecr=918273645 len=1
-      seq=713228238 ack=3221225512 win=65193 tsval=751858357 tsecr=918273645 len=1  <- late packet: no regression
-      seq=713228239 ack=3221225522 win=65460 tsval=751858370 tsecr=918273657 len=1  <- both advance
-
-  versus the same exchange in `fixed` mode:
-
-      seq=1 ack=1 win=65535 (no options) len=5
-      seq=1 ack=1 win=65535 (no options) len=14
-
-  What `realistic` still does **not** disguise: the absent SYN handshake (by
-  design — it is the whole point), and the absence of SACK blocks, which a real
-  loss-affected stream would occasionally carry. It also cannot fake a plausible
-  *response* to loss, since KCP/QUIC above us own retransmission. A DPI comparing
-  against a genuine stack can still tell.
-
-`tcp_flags` genuinely does not have to match: each side crafts its own packets and
-the receiver accepts any flags but SYN.
-
-**`seq_mode` DOES have to match** — this is the one that bites. gfk ignores the
-peer's numbers, but a stateful NAT does not. It validates your climbing seq
-against *the peer's last ack plus the peer's window*; a `fixed` peer acks `1`
-forever, so that ceiling never rises, and one window later (65535 bytes — about
-24 s on a slow link, which is exactly the failure this project already hit) every
-packet you send is out-of-window and dropped. Realistic mode is safe **only**
-because a realistic peer's ack advances to cover what you sent. So:
-
-| client | server | result |
-|---|---|---|
-| `fixed` | `fixed` | safest, and the default. Obvious in a capture. |
-| `realistic` | `realistic` | looks like a real stream, and the acks keep each other in-window. |
-| `realistic` | `fixed` (either way round) | **broken** — dies one 64 KB window in. |
-
-gfk detects the broken pairing at runtime: after three inbound packets stuck at
-`seq=1` it logs
-
-    peer looks like seq_mode: fixed while this side is realistic — set seq_mode
-    the same on both ends, or a stateful NAT will drop this direction about one
-    64 KB window from now
-
-If a matched `realistic` pair still dies after ~24 s, some box on the path is
-unhappy in a way we have not modelled: fall back to `fixed`.
-
-#### Why 24 seconds — it was never a 32-bit overflow
-
-Worth spelling out, because the obvious reading of "the sequence ran out" is wrong
-and the mistake is easy to repeat. Sequence numbers are 32-bit: 2³² is **4.29 GB**,
-and burning that in 24 s would take 1.43 Gbps. The number that actually ran out was
-the **16-bit window**, 65535 bytes — and 65535 ÷ 24 s = **2.7 KB/s**, an idle
-tunnel ticking over on keepalives.
-
-The arithmetic closes exactly: the window is ¹⁄₆₅₅₃₆ of the sequence space, at
-2.7 KB/s a true 2³² rollover would take 18.2 days, and 18.2 days ÷ 65536 = 24.0 s.
-
-The mechanism: conntrack allows `peer's_last_ack + peer's_window` and drops the
-rest. In a real connection that ceiling *slides*, because the receiver's ack keeps
-advancing. With a frozen ack it never moves, so you get exactly one window of
-traffic and then that direction goes silent — no reset, no error, packets simply
-stop being forwarded. `fixed` mode is immune because seq never moves (`1 ≤ 65536`
-forever); `realistic` mode is safe because both sides' acks advance and the window
-slides again. Nothing here has anything to do with 2³², which is why the rollover
-now needs no special handling at all — it just wraps, like TCP.
-
-### How packets are captured (and what it costs)
-
-There is **no kernel-level filter**. Linux binds `AF_PACKET`/`SOCK_DGRAM` with
-`ETH_P_IP` to the NIC, Windows opens Npcap in promiscuous mode with no BPF
-program, so *every* IPv4 packet on the interface is copied to userspace. The
-carrier then decides in Go, per packet, in this order:
-
-1. parse as IPv4+TCP — anything else is dropped;
-2. drop if **SYN** is set (not carrier data) or the payload is empty;
-3. **port match** — server: destination port inside `[server_port,
-   server_port+server_port_span)`; client: source IP/port must be the VPS and the
-   destination port the current rotated client port.
-
-So the port span is a userspace comparison, not a capture filter, and no TCP flag
-other than SYN takes part in the decision. Measured on an i5-13420H:
-
-| per packet | cost | allocations |
-|---|---|---|
-| parse + reject (not our port) | ~370 ns | 1216 B |
-| parse + accept + hand to transport | ~1.1 µs | 2808 B |
-| craft + serialize an outbound packet | ~1.6 µs | 5504 B |
-
-That is ~2.7 M rejected packets/s per core, so at ordinary VPS rates the capture
-is not the bottleneck: 100 Mbps of unrelated traffic (~9 k pkt/s) costs well under
-1% of a core, and the accept path sustains ~875 k pkt/s (≈9 Gbps at mtu 1400).
-Two caveats worth knowing:
-
-- The cost scales with **packets per second on the whole interface**, not with
-  tunnel throughput. A small-packet flood (≥500 k pkt/s) on a busy VPS will burn
-  real CPU parsing packets that are then discarded.
-- The allocation volume matters more than the CPU: ~1.2 KB of garbage per captured
-  packet is GC pressure at high rates. Attaching a real BPF filter (the unused
-  `bpfFilter` sketch in `packetio.go`) or hand-rolling the 20-byte header parse
-  would remove nearly all of it. Neither is needed at current speeds.
-
-Run the numbers yourself with `go test ./internal/carrier/ -bench . -run XXX`.
 
 ### Restricting destination ports (server)
 
@@ -384,24 +204,6 @@ Set the same `nc` + window on **both** ends. For a lossy/adversarial link add
 Avoid `nc: 0` — kcp-go's congestion control underperforms badly over this carrier
 (collapses throughput). Bound bufferbloat with the window instead.
 
-### Logging and client privacy (`log_level`)
-
-`log_level` takes `none | error | warn | info | debug`, and it also decides how
-much of a peer address reaches the log — the server log is the one place a
-client's real IP appears:
-
-| level | what is logged | peer address |
-|---|---|---|
-| `none` | nothing at all | never printed |
-| `error` | failures | masked |
-| `warn` | failures + warnings | masked |
-| `info` (default) | normal operation | masked: `peer=140.170.*.*:443` |
-| `debug` | everything, incl. per-session detail | full: `peer=140.170.23.9:443` |
-
-Masking drops the last two IPv4 octets (the last six IPv6 groups), keeping enough
-to tell which network a client came from without identifying it. A hostname that
-is not an IP is replaced entirely with `*`. Use `debug` only while
-troubleshooting: that log identifies your users.
 
 ## Requirements
 
@@ -412,39 +214,9 @@ troubleshooting: that log identifies your users.
 ## Windows GUI
 
 `gfk-windows-GUI.exe` is a single self-contained window (no runtime deps beyond Npcap):
-enter VPS IP / shared key / transport / SOCKS5 / forwards (or Load a client.yaml),
-tick "Manage firewall", and Connect. It shows live connection status, up/down
-throughput, and a log pane. Run as Administrator.
 
-The log pane is **selectable**: drag to select, right-click for Copy / Select all,
-or Ctrl+C. The Copy button still grabs the whole log in one click. It renders in a
-monospace font, which is also what makes the startup banner line up — the banner is
-centred with spaces, so it only looks centred when every glyph is the same width.
-Long lines are not wrapped (the pane scrolls sideways instead), so a wide
-`settings in effect` line stays on one line and the banner keeps its shape on a
-narrow window. The trade-off for selectable text is that Fyne's editable widget
-carries a single colour for all of it, so log lines are no longer tinted by level —
-each line still names its level as text (`15:04:05 WARN  msg=...`).
-
-### The GUI honours the whole config file, not just its fields
-
-The window deliberately exposes only the handful of settings people change often.
-Everything else is still read from the YAML and applied on Connect:
-
-| in the window | file-only (no widget) |
-|---|---|
-| vps_ip, shared key, transport, mtu | carrier.interface, carrier.tcp_flags, carrier.seq_mode |
-| server_port + span, client_port + span | the whole `kcp:` and `quic:` blocks |
-| socks5_listen, forwards, manage firewall | client.keepalive_seconds, client.reconnect_seconds, log_level |
-
-So the normal flow works as expected: **Load** a config, change the VPS IP, hit
-**Connect** — your FEC settings, window sizes, `seq_mode`, NIC override and log
-level all still apply. Editing a field only overrides that field. **Save** writes
-the merged result back (as plain YAML — comments in the original file are lost).
 
 A `client.yaml` (or `gfk.yaml`) sitting next to the exe is loaded automatically at
 startup, so the file-only settings are in effect even before you press Load.
 
-To confirm what actually took effect, read the `settings in effect` line the log
-pane prints on Connect — it lists every file-only value. The CLI prints the same
-line at startup.
+![gfk Windows GUI](docs/gfk-gui.png)
