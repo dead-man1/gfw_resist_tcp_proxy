@@ -197,23 +197,46 @@ carrier:
     as a seq of `1`. The first packet from the peer replaces the guess with the
     truth, and from then on the ack only ever moves forward, exactly like a real
     cumulative ack (a reordered or retransmitted segment cannot pull it back).
-  - Port rotation starts a fresh ISN and a fresh guess, since the new 4-tuple is a
-    new connection to everything on the path.
+  - **window** jitters within `[64800, 65535]` instead of being the same value on
+    every packet. The band is deliberately narrow: this field is also what a
+    stateful middlebox uses as the ceiling for the *peer's* sequence numbers
+    (conntrack's `td_maxend = our_ack + our_window`), and with no SYN there is no
+    window scale to negotiate, so 65535 is a hard maximum and every byte shaved
+    off is a byte less of the peer's data allowed in flight. ~1% jitter breaks the
+    constant-value signature without trading away robustness.
+  - **RFC 7323 timestamps** are added — `NOP, NOP, TS` (12 bytes), byte for byte
+    the option block Linux and Windows put on established-connection segments. A
+    bare 20-byte header mid-stream is itself a signature. TSval is a per-flow
+    random base over a 1 ms clock (as Linux offsets each connection); TSecr echoes
+    the peer's clock, following the same guess-then-truth-then-forward-only rule as
+    the ack. A peer that sends no timestamps is tolerated.
+  - Port rotation starts a fresh ISN, a fresh ack guess and a fresh timestamp base,
+    since the new 4-tuple is a new connection to everything on the path.
+  - The 12 option bytes come **out of the payload budget**, not on top of it, so
+    the IP packet is `mtu + 40` in both modes and switching cannot push a
+    path-MTU-limited link over the edge. The startup log shows both figures
+    (`mtu=1400 transport_mtu=1388`).
 
   A dump of a live `realistic` flow (client side), before and after the server
   first speaks:
 
-      seq=205754368  ack=964942046   len=5     <- ack is the plausible guess
-      seq=205754373  ack=964942046   len=14
-      ... server sends 40 bytes at seq 3221225472 ...
-      seq=205754387  ack=3221225512  len=1     <- ack = peer seq + 40, the truth
-      seq=205754388  ack=3221225512  len=1     <- a late server packet cannot regress it
-      seq=205754389  ack=3221225522  len=1
+      seq=713228218 ack=871834161  win=65244 tsval=751858357 tsecr=417278681 len=5
+      seq=713228223 ack=871834161  win=65009 tsval=751858357 tsecr=417278681 len=14
+      ... server sends 40 bytes at seq 3221225472, tsval 918273645 ...
+      seq=713228237 ack=3221225512 win=64847 tsval=751858357 tsecr=918273645 len=1
+      seq=713228238 ack=3221225512 win=65193 tsval=751858357 tsecr=918273645 len=1  <- late packet: no regression
+      seq=713228239 ack=3221225522 win=65460 tsval=751858370 tsecr=918273657 len=1  <- both advance
+
+  versus the same exchange in `fixed` mode:
+
+      seq=1 ack=1 win=65535 (no options) len=5
+      seq=1 ack=1 win=65535 (no options) len=14
 
   What `realistic` still does **not** disguise: the absent SYN handshake (by
-  design — it is the whole point), a constant 65535 window, and a bare 20-byte TCP
-  header with no options, where a real Linux or Windows peer would usually carry
-  timestamps and SACK. A DPI comparing against a genuine stack can still tell.
+  design — it is the whole point), and the absence of SACK blocks, which a real
+  loss-affected stream would occasionally carry. It also cannot fake a plausible
+  *response* to loss, since KCP/QUIC above us own retransmission. A DPI comparing
+  against a genuine stack can still tell.
 
 `tcp_flags` genuinely does not have to match: each side crafts its own packets and
 the receiver accepts any flags but SYN.

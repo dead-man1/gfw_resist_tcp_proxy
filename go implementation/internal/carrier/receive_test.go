@@ -134,7 +134,7 @@ func TestReceiverAcceptsAnyFlagsFromRealSender(t *testing.T) {
 		c := newTestServer(nil, f)
 
 		// Craft exactly as a peer configured with these flags would.
-		pkt, err := craftSegment(net.IPv4(198, 51, 100, 7), net.IPv4(203, 0, 113, 9),
+		pkt, err := testSegment(net.IPv4(198, 51, 100, 7), net.IPv4(203, 0, 113, 9),
 			40000, 45000, 987654321, 123456789, flags, []byte("data"))
 		if err != nil {
 			t.Fatal(err)

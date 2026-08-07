@@ -28,7 +28,7 @@ func (w *warnRecorder) count() int {
 // the receive loop to hand it up.
 func feedFromServer(t *testing.T, c *Carrier, f *fakeIO, seq uint32, payload string) {
 	t.Helper()
-	pkt, err := craftSegment(c.opts.VPSIP, c.localIP, 45000, 40000, seq, 1, DefaultTCPFlags(), []byte(payload))
+	pkt, err := testSegment(c.opts.VPSIP, c.localIP, 45000, 40000, seq, 1, DefaultTCPFlags(), []byte(payload))
 	if err != nil {
 		t.Fatal(err)
 	}

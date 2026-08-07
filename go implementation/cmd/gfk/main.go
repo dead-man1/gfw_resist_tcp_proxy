@@ -138,9 +138,11 @@ func main() {
 	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()), "interface", cfg.Carrier.Interface)
 
 	params := transport.Params{
-		Transport:        cfg.Transport,
-		Key:              cfg.Auth.Key,
-		MTU:              cfg.Carrier.MTU,
+		Transport: cfg.Transport,
+		Key:       cfg.Auth.Key,
+		// Not cfg.Carrier.MTU: realistic mode spends 12 header bytes on the
+		// timestamp option, and the IP packet must stay the same size either way.
+		MTU:              cfg.TransportMTU(),
 		KeepAliveSeconds: cfg.Client.KeepAliveSeconds,
 		KCP:              cfg.KCP,
 		QUIC:             cfg.QUIC,

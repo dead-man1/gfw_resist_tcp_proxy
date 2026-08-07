@@ -132,6 +132,16 @@ type seqState struct {
 	// ack holds a plausible guess (see reset); the first inbound packet replaces
 	// it outright, and from then on the ack only ever moves forward.
 	seen bool
+
+	// Timestamp option state (RFC 7323). tsBase + milliseconds since tsStart is
+	// what we advertise: a per-flow random offset over a 1 ms clock, which is how
+	// Linux presents its own timestamps. tsEcr is the peer's last TSval, echoed
+	// back; like ack it begins as a plausible guess and becomes the truth on the
+	// peer's first packet.
+	tsBase  uint32
+	tsStart time.Time
+	tsEcr   uint32
+	tsSeen  bool
 }
 
 func newSeqState() *seqState {
@@ -152,14 +162,19 @@ func newSeqState() *seqState {
 // ack we send is the truth.
 func (s *seqState) reset() {
 	isn, ack := randomISN(), randomISN()
+	// A real stack offsets each connection's timestamp clock by a random amount
+	// (Linux: tcp_timestamp_offset), so a fresh flow gets a fresh base rather than
+	// continuing a global counter that would tie our flows together.
+	tsBase, tsEcr, now := rand.Uint32(), rand.Uint32(), time.Now()
 	s.mu.Lock()
 	s.isn, s.seq, s.ack, s.seen = isn, isn, ack, false
+	s.tsBase, s.tsStart, s.tsEcr, s.tsSeen = tsBase, now, tsEcr, false
 	s.mu.Unlock()
 }
 
-// next reserves n bytes of sequence space and returns the seq/ack pair for the
+// next reserves n bytes of sequence space and returns the header numbers for the
 // segment carrying them.
-func (s *seqState) next(n uint32) (seq, ack uint32) {
+func (s *seqState) next(n uint32) (seq, ack uint32, ts tcpTimestamps) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.seq+n < s.seq { // would carry us past 2^32: restart at the ISN
@@ -167,7 +182,15 @@ func (s *seqState) next(n uint32) (seq, ack uint32) {
 	}
 	seq, ack = s.seq, s.ack
 	s.seq += n
-	return seq, ack
+	// A 1 ms clock, wrapping naturally like a real one. Monotonic within the flow
+	// because tsStart only moves on reset, which redraws tsBase at the same time.
+	// Read under the lock: reset writes tsStart/tsBase together and we must not see
+	// a torn pair (a new base against the old start would jump the clock).
+	ts = tcpTimestamps{
+		val: s.tsBase + uint32(time.Since(s.tsStart).Milliseconds()),
+		ecr: s.tsEcr,
+	}
+	return seq, ack, ts
 }
 
 // observe records an inbound segment so our next ack reflects it, the way a real
@@ -180,7 +203,7 @@ func (s *seqState) next(n uint32) (seq, ack uint32) {
 // reordered or retransmitted packet must not walk it backwards. The comparison is
 // serial-number arithmetic (RFC 1982), so it stays correct across a 2^32 wrap and
 // treats the peer's own overflow restart as forward motion.
-func (s *seqState) observe(peerSeq uint32, payloadLen int) {
+func (s *seqState) observe(peerSeq uint32, payloadLen int, peerTS uint32, hasTS bool) {
 	ack := peerSeq + uint32(payloadLen)
 	if ack == 0 {
 		ack = 1 // ack 0 does not occur in an established stream
@@ -188,6 +211,15 @@ func (s *seqState) observe(peerSeq uint32, payloadLen int) {
 	s.mu.Lock()
 	if !s.seen || int32(ack-s.ack) > 0 {
 		s.ack, s.seen = ack, true
+	}
+	// TSecr echoes the peer's clock, under the same rules as the ack: adopt the
+	// first real value we see, then follow it forward only (the peer's own clock is
+	// monotonic, so a regression means a reordered packet). A peer with no
+	// timestamps — an older build, or one in fixed mode — leaves the guess in
+	// place, which is the best we can do and harms nothing: no middlebox validates
+	// TSecr, and PAWS lives in endpoints we do not have.
+	if hasTS && (!s.tsSeen || int32(peerTS-s.tsEcr) > 0) {
+		s.tsEcr, s.tsSeen = peerTS, true
 	}
 	s.mu.Unlock()
 }
@@ -475,7 +507,7 @@ func (c *Carrier) recvLoop() {
 		// Mirror the peer's sequence number into our ack, so the numbers we craft
 		// stay consistent with the stream a middlebox is watching.
 		if c.seqMode == SeqRealistic {
-			c.seqFor(addr).observe(seg.seq, len(seg.payload))
+			c.seqFor(addr).observe(seg.seq, len(seg.payload), seg.tsVal, seg.hasTS)
 			c.checkPeerSeqMode(seg.seq)
 		}
 
@@ -556,11 +588,24 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 		dstIP, dstPort = ip, port
 	}
 
-	seq, ack := uint32(carrierSeq), uint32(carrierAck)
-	if c.seqMode == SeqRealistic {
-		seq, ack = c.seqFor(peer).next(uint32(len(p)))
+	// Fixed mode emits exactly the header it always has: constant seq/ack, a full
+	// window, no options. Realistic mode adds the sequence bookkeeping, a jittered
+	// window and the timestamp option.
+	spec := segmentSpec{
+		srcIP: srcIP, dstIP: dstIP,
+		srcPort: srcPort, dstPort: dstPort,
+		seq: carrierSeq, ack: carrierAck,
+		flags:   c.flags(),
+		window:  maxWindow,
+		payload: p,
 	}
-	ipPkt, err := craftSegment(srcIP, dstIP, srcPort, dstPort, seq, ack, c.flags(), p)
+	if c.seqMode == SeqRealistic {
+		seq, ack, ts := c.seqFor(peer).next(uint32(len(p)))
+		spec.seq, spec.ack = seq, ack
+		spec.window = randomWindow()
+		spec.ts = &ts
+	}
+	ipPkt, err := craftSegment(spec)
 	if err != nil {
 		return 0, err
 	}

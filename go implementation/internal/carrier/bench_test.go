@@ -47,7 +47,7 @@ func (b *benchIO) Close() error {
 
 func benchPacket(b *testing.B, dstPort uint16, payloadLen int) []byte {
 	b.Helper()
-	pkt, err := craftSegment(net.IPv4(198, 51, 100, 7), net.IPv4(203, 0, 113, 9),
+	pkt, err := testSegment(net.IPv4(198, 51, 100, 7), net.IPv4(203, 0, 113, 9),
 		40000, dstPort, 1, 1, DefaultTCPFlags(), make([]byte, payloadLen))
 	if err != nil {
 		b.Fatal(err)
@@ -131,18 +131,51 @@ func BenchmarkCraftSegment(b *testing.B) {
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := craftSegment(src, dst, 40000, 45000, 1, 1, flags, payload); err != nil {
+		if _, err := testSegment(src, dst, 40000, 45000, 1, 1, flags, payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkCraftSegmentRealistic is the same, with everything realistic mode adds
+// to the header: a jittered window and the 12-byte timestamp option.
+func BenchmarkCraftSegmentRealistic(b *testing.B) {
+	src, dst := net.IPv4(192, 168, 1, 5), net.IPv4(203, 0, 113, 10)
+	payload := make([]byte, 1400-tsOptionLen)
+	flags := DefaultTCPFlags()
+	s := newSeqState()
+	b.SetBytes(int64(len(payload)))
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		seq, ack, ts := s.next(uint32(len(payload)))
+		_, err := craftSegment(segmentSpec{
+			srcIP: src, dstIP: dst,
+			srcPort: 40000, dstPort: 45000,
+			seq: seq, ack: ack,
+			flags:   flags,
+			window:  randomWindow(),
+			ts:      &ts,
+			payload: payload,
+		})
+		if err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
 // BenchmarkSeqStateNext is the extra bookkeeping seq_mode: realistic adds per
-// sent packet.
+// sent packet (sequence arithmetic plus the timestamp clock read).
 func BenchmarkSeqStateNext(b *testing.B) {
 	s := newSeqState()
 	for i := 0; i < b.N; i++ {
 		s.next(1400)
+	}
+}
+
+// BenchmarkRandomWindow is the per-packet window jitter.
+func BenchmarkRandomWindow(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		randomWindow()
 	}
 }
 

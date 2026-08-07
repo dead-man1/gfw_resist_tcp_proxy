@@ -9,7 +9,9 @@
 package carrier
 
 import (
+	"encoding/binary"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -163,44 +165,126 @@ func ParseSeqMode(s string) (SeqMode, error) {
 	return SeqFixed, fmt.Errorf("unknown value %q, want %q or %q", s, SeqFixed, SeqRealistic)
 }
 
+// Window advertisement. maxWindow is what fixed mode sends on every segment and
+// the top of the range realistic mode varies within.
+//
+// minWindow is deliberately close to maxWindow, and that is a correctness
+// constraint rather than timidity: this field is also what a stateful middlebox
+// uses as the ceiling for the PEER's sequence numbers (conntrack computes
+// td_maxend = our_ack + our_window). Because the carrier never sends a SYN, no
+// window scale can be negotiated, so 65535 is the hard maximum and every byte we
+// shave off is a byte less of the peer's data that may be in flight. A ~1% jitter
+// is enough to break the "identical on every packet" signature; anything wider
+// would trade real robustness for cosmetics.
+const (
+	maxWindow = 65535
+	minWindow = 64800
+)
+
+// tsOptionLen is the on-the-wire size of the NOP,NOP,Timestamps option block that
+// realistic mode adds to every segment. It comes out of the payload budget — see
+// TCPOptionBytes.
+const tsOptionLen = 12
+
+// tcpTimestamps is the RFC 7323 pair: our clock, and the last value we heard from
+// the peer.
+type tcpTimestamps struct {
+	val uint32
+	ecr uint32
+}
+
+// segmentSpec is everything that varies between crafted segments. It is a struct
+// rather than a parameter list because realistic mode made it too long to read.
+type segmentSpec struct {
+	srcIP, dstIP     net.IP
+	srcPort, dstPort uint16
+	seq, ack         uint32
+	flags            TCPFlags
+	// window of 0 means maxWindow.
+	window uint16
+	// ts, when non-nil, adds the timestamp option (realistic mode only).
+	ts      *tcpTimestamps
+	payload []byte
+}
+
+// TCPOptionBytes reports how many bytes of TCP options the carrier adds to every
+// segment in the given seq mode. Callers must subtract it from the payload budget
+// they hand the reliability layer, otherwise switching to realistic mode grows
+// every IP packet by that much and a path that was exactly at its MTU starts
+// black-holing DF-set packets.
+func TCPOptionBytes(mode SeqMode) int {
+	if mode == SeqRealistic {
+		return tsOptionLen
+	}
+	return 0
+}
+
+// randomWindow picks a window advertisement for realistic mode: high, but not the
+// same value on every packet. See the minWindow comment for why the band is tight.
+func randomWindow() uint16 {
+	return uint16(minWindow + rand.UintN(maxWindow-minWindow+1))
+}
+
 // craftSegment serializes a full IPv4 packet carrying a TCP segment with the
 // given flags, sequence numbers and payload. It returns the raw IP bytes (no
 // Ethernet header).
-func craftSegment(srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, payload []byte) ([]byte, error) {
+func craftSegment(s segmentSpec) ([]byte, error) {
 	ip := &layers.IPv4{
 		Version:  4,
 		IHL:      5,
 		TTL:      64,
 		Flags:    layers.IPv4DontFragment,
 		Protocol: layers.IPProtocolTCP,
-		SrcIP:    srcIP.To4(),
-		DstIP:    dstIP.To4(),
+		SrcIP:    s.srcIP.To4(),
+		DstIP:    s.dstIP.To4(),
+	}
+	window := s.window
+	if window == 0 {
+		window = maxWindow // fixed mode, and any caller that does not care
 	}
 	tcp := &layers.TCP{
-		SrcPort: layers.TCPPort(srcPort),
-		DstPort: layers.TCPPort(dstPort),
-		Seq:     seq,
-		Ack:     ack,
-		ACK:     flags.ACK,
+		SrcPort: layers.TCPPort(s.srcPort),
+		DstPort: layers.TCPPort(s.dstPort),
+		Seq:     s.seq,
+		Ack:     s.ack,
+		ACK:     s.flags.ACK,
 		// PSH means "deliver what you have now", which is meaningless on an empty
 		// segment; a real stack never sets it there, so neither do we.
-		PSH:    flags.PSH && len(payload) > 0,
-		URG:    flags.URG && len(payload) > 0,
-		FIN:    flags.FIN,
-		Window: 65535,
+		PSH:    s.flags.PSH && len(s.payload) > 0,
+		URG:    s.flags.URG && len(s.payload) > 0,
+		FIN:    s.flags.FIN,
+		Window: window,
 	}
 	if tcp.URG {
 		// A set URG bit with a zero urgent pointer is a well-known invalid
 		// combination that middleboxes normalise or drop; point it past the last
 		// payload byte, as a sender flagging the whole segment would.
-		tcp.Urgent = uint16(len(payload))
+		tcp.Urgent = uint16(len(s.payload))
+	}
+	if s.ts != nil {
+		// NOP, NOP, Timestamps — 12 bytes, already 4-byte aligned. This is byte for
+		// byte the option layout Linux and Windows put on established-connection
+		// segments, which is the point: a bare 20-byte header mid-stream is itself a
+		// signature. gopacket fills in DataOffset from the options (FixLengths).
+		var data [8]byte
+		binary.BigEndian.PutUint32(data[0:4], s.ts.val)
+		binary.BigEndian.PutUint32(data[4:8], s.ts.ecr)
+		tcp.Options = []layers.TCPOption{
+			{OptionType: layers.TCPOptionKindNop},
+			{OptionType: layers.TCPOptionKindNop},
+			{
+				OptionType:   layers.TCPOptionKindTimestamps,
+				OptionLength: 10,
+				OptionData:   data[:],
+			},
+		}
 	}
 	if err := tcp.SetNetworkLayerForChecksum(ip); err != nil {
 		return nil, err
 	}
 	buf := gopacket.NewSerializeBuffer()
 	opts := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(buf, opts, ip, tcp, gopacket.Payload(payload)); err != nil {
+	if err := gopacket.SerializeLayers(buf, opts, ip, tcp, gopacket.Payload(s.payload)); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil
@@ -214,7 +298,21 @@ type segment struct {
 	dstPort uint16
 	synOnly bool   // true if SYN set (we ignore these — they are not carrier data)
 	seq     uint32 // the peer's sequence number, mirrored back as our ack in realistic mode
+	tsVal   uint32 // the peer's timestamp clock, echoed back as our TSecr
+	hasTS   bool   // whether the peer carried a timestamp option at all
 	payload []byte
+}
+
+// peerTSVal pulls the peer's TSval out of an already-decoded TCP layer. gopacket
+// parses the option list as part of decoding the TCP header, so this only walks a
+// slice that exists either way.
+func peerTSVal(tcp *layers.TCP) (uint32, bool) {
+	for _, o := range tcp.Options {
+		if o.OptionType == layers.TCPOptionKindTimestamps && len(o.OptionData) >= 8 {
+			return binary.BigEndian.Uint32(o.OptionData[0:4]), true
+		}
+	}
+	return 0, false
 }
 
 // parseIPv4 parses raw IPv4 bytes into a TCP segment. ok is false if the packet
@@ -238,6 +336,7 @@ func parseIPv4(data []byte) (segment, bool) {
 	seg.dstPort = uint16(tcp.DstPort)
 	seg.synOnly = tcp.SYN
 	seg.seq = tcp.Seq
+	seg.tsVal, seg.hasTS = peerTSVal(tcp)
 	seg.payload = tcp.Payload
 	return seg, true
 }

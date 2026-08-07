@@ -43,6 +43,20 @@ func (f *fakeIO) Close() error {
 	return nil
 }
 
+// testSegment crafts a plain carrier packet the way fixed mode would: full
+// window, no options. Tests that care about the window or the timestamp option
+// build a segmentSpec directly.
+func testSegment(srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags TCPFlags, payload []byte) ([]byte, error) {
+	return craftSegment(segmentSpec{
+		srcIP: srcIP, dstIP: dstIP,
+		srcPort: srcPort, dstPort: dstPort,
+		seq: seq, ack: ack,
+		flags:   flags,
+		window:  maxWindow,
+		payload: payload,
+	})
+}
+
 // newTestServer builds a server Carrier around a fake backend, bypassing the
 // real socket/interface setup in Open.
 func newTestServer(vpsIP net.IP, pio packetIO) *Carrier {
@@ -60,7 +74,7 @@ func newTestServer(vpsIP net.IP, pio packetIO) *Carrier {
 // the transport would see from ReadFrom.
 func feedInbound(t *testing.T, c *Carrier, f *fakeIO, clientIP, addressedIP net.IP, payload string) net.Addr {
 	t.Helper()
-	pkt, err := craftSegment(clientIP, addressedIP, 40000, 45000, 1, 1, DefaultTCPFlags(), []byte(payload))
+	pkt, err := testSegment(clientIP, addressedIP, 40000, 45000, 1, 1, DefaultTCPFlags(), []byte(payload))
 	if err != nil {
 		t.Fatalf("craftSegment: %v", err)
 	}
@@ -179,7 +193,7 @@ func TestServerPortSpan(t *testing.T) {
 	addressed := net.IPv4(203, 0, 113, 9)
 
 	// client targets server port 45003 (inside the span) — must be accepted.
-	pkt, err := craftSegment(client, addressed, 40000, 45003, 1, 1, DefaultTCPFlags(), []byte("hi"))
+	pkt, err := testSegment(client, addressed, 40000, 45003, 1, 1, DefaultTCPFlags(), []byte("hi"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +224,7 @@ func TestServerPortSpan(t *testing.T) {
 	}
 
 	// a port outside the span must be ignored.
-	pkt2, _ := craftSegment(client, addressed, 40000, 45100, 1, 1, DefaultTCPFlags(), []byte("nope"))
+	pkt2, _ := testSegment(client, addressed, 40000, 45100, 1, 1, DefaultTCPFlags(), []byte("nope"))
 	f.inbound <- pkt2
 	_ = c.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 	if _, _, err := c.ReadFrom(buf); err == nil {

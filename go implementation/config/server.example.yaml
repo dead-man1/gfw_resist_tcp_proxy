@@ -19,10 +19,14 @@ carrier:
                           # Need NOT match the client (each side only crafts its own packets).
   seq_mode: fixed         # fixed | realistic — TCP sequence numbers on carrier packets.
                           #   fixed:     seq = ack = 1 always. Safest with window-tracking NAT.
-                          #   realistic: BOTH seq and ack behave like a real connection, tracked
-                          #              per client: random ISN, seq grows by the payload length,
-                          #              ack tracks that client's stream forward-only, restarting
-                          #              at the ISN instead of overflowing.
+                          #   realistic: the whole header looks like an established connection,
+                          #              tracked per client: random ISN with seq growing by the
+                          #              payload length; an ack that tracks that client
+                          #              forward-only; a window jittering near 65535; and RFC 7323
+                          #              timestamps (NOP,NOP,TS) as a real stack sends mid-stream.
+                          #              Restarts at the ISN instead of overflowing. Costs 12
+                          #              header bytes, taken off the payload so the IP packet
+                          #              stays exactly mtu+40 either way.
                           # MUST MATCH THE CLIENT. Not because gfk reads the peer's numbers (it
                           # doesn't) but because a stateful NAT checks a climbing seq against the
                           # peer's ack: a fixed peer acks 1 forever, so ~64 KB later that

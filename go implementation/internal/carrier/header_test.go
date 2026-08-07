@@ -74,7 +74,7 @@ func TestParseTCPFlags(t *testing.T) {
 func TestCraftSegmentFlags(t *testing.T) {
 	src, dst := net.IPv4(192, 168, 1, 5), net.IPv4(203, 0, 113, 10)
 
-	pkt, err := craftSegment(src, dst, 40000, 45000, 1, 1, TCPFlags{ACK: true, PSH: true, URG: true, FIN: true}, []byte("hello"))
+	pkt, err := testSegment(src, dst, 40000, 45000, 1, 1, TCPFlags{ACK: true, PSH: true, URG: true, FIN: true}, []byte("hello"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +95,7 @@ func TestCraftSegmentFlags(t *testing.T) {
 	}
 
 	// PSH/URG mean nothing on an empty segment, so they must be dropped there.
-	pkt, err = craftSegment(src, dst, 40000, 45000, 1, 1, TCPFlags{ACK: true, PSH: true, URG: true}, nil)
+	pkt, err = testSegment(src, dst, 40000, 45000, 1, 1, TCPFlags{ACK: true, PSH: true, URG: true}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +185,7 @@ func TestRealisticSeqAdvancesAndAcks(t *testing.T) {
 	}
 
 	// Feed an inbound segment: the next ack must cover its last byte.
-	pkt, err := craftSegment(c.opts.VPSIP, c.localIP, 45000, 40000, 900000, 1, DefaultTCPFlags(), []byte("1234567890"))
+	pkt, err := testSegment(c.opts.VPSIP, c.localIP, 45000, 40000, 900000, 1, DefaultTCPFlags(), []byte("1234567890"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +221,8 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 		if guess == carrierAck {
 			t.Fatal("a fresh flow should not ack 1")
 		}
-		s.observe(peerSeq, 10)
-		if _, ack := s.next(1); ack != peerSeq+10 {
+		s.observe(peerSeq, 10, 0, false)
+		if _, ack, _ := s.next(1); ack != peerSeq+10 {
 			t.Errorf("peer_seq=%d: ack = %d, want %d (guess was %d)", peerSeq, ack, peerSeq+10, guess)
 		}
 	}
@@ -230,22 +230,22 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 	// Forward motion only: a reordered/retransmitted earlier segment must not
 	// pull the ack back.
 	s := newSeqState()
-	s.observe(100000, 100) // ack -> 100100
-	s.observe(90000, 100)  // an older segment arriving late
-	if _, ack := s.next(1); ack != 100100 {
+	s.observe(100000, 100, 0, false) // ack -> 100100
+	s.observe(90000, 100, 0, false)  // an older segment arriving late
+	if _, ack, _ := s.next(1); ack != 100100 {
 		t.Errorf("ack = %d, want it to stay at 100100; a cumulative ack never regresses", ack)
 	}
-	s.observe(100100, 400) // genuinely new data
-	if _, ack := s.next(1); ack != 100500 {
+	s.observe(100100, 400, 0, false) // genuinely new data
+	if _, ack, _ := s.next(1); ack != 100500 {
 		t.Errorf("ack = %d, want 100500", ack)
 	}
 
 	// Serial arithmetic: when the peer's own counter restarts (its overflow), the
 	// large backward step reads as forward motion and must be adopted, not ignored.
 	s = newSeqState()
-	s.observe(0xFFFFFF00, 16) // ack -> 0xFFFFFF10
-	s.observe(0x20000000, 8)  // peer restarted at a fresh ISN
-	if _, ack := s.next(1); ack != 0x20000008 {
+	s.observe(0xFFFFFF00, 16, 0, false) // ack -> 0xFFFFFF10
+	s.observe(0x20000000, 8, 0, false)  // peer restarted at a fresh ISN
+	if _, ack, _ := s.next(1); ack != 0x20000008 {
 		t.Errorf("ack = %#x, want %#x after the peer restarted", ack, 0x20000008)
 	}
 
@@ -267,15 +267,15 @@ func TestSeqOverflowRestartsAtISN(t *testing.T) {
 	s := &seqState{isn: 1000, seq: 1000, ack: 1}
 	s.seq = 0xFFFFFFF0 // 16 bytes of space left before the wrap
 
-	if seq, _ := s.next(10); seq != 0xFFFFFFF0 {
+	if seq, _, _ := s.next(10); seq != 0xFFFFFFF0 {
 		t.Fatalf("seq = %#x, want the pre-wrap value", seq)
 	}
 	// 0xFFFFFFFA + 10 would wrap: expect a restart at the ISN instead.
-	seq, _ := s.next(10)
+	seq, _, _ := s.next(10)
 	if seq != 1000 {
 		t.Errorf("seq = %#x, want a restart at the ISN (1000)", seq)
 	}
-	if next, _ := s.next(1); next != 1010 {
+	if next, _, _ := s.next(1); next != 1010 {
 		t.Errorf("seq = %d, want the restarted counter to keep climbing (1010)", next)
 	}
 }

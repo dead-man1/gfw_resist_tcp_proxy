@@ -187,6 +187,40 @@ func TestEffectiveAttrs(t *testing.T) {
 	}
 }
 
+// TestTransportMTU: realistic mode spends 12 header bytes on the timestamp
+// option, and they must come out of the payload budget so the IP packet stays the
+// same size in both modes. Otherwise switching modes could break a link that sits
+// exactly at its path MTU.
+func TestTransportMTU(t *testing.T) {
+	c := validServer()
+	c.Carrier.MTU = 1400
+
+	c.Carrier.SeqMode = string(carrier.SeqFixed)
+	if got := c.TransportMTU(); got != 1400 {
+		t.Errorf("fixed mode: TransportMTU = %d, want the configured 1400", got)
+	}
+
+	c.Carrier.SeqMode = string(carrier.SeqRealistic)
+	want := 1400 - carrier.TCPOptionBytes(carrier.SeqRealistic)
+	if got := c.TransportMTU(); got != want {
+		t.Errorf("realistic mode: TransportMTU = %d, want %d", got, want)
+	}
+
+	// An omitted seq_mode behaves as fixed, not as an error or a zero budget.
+	c.Carrier.SeqMode = ""
+	if got := c.TransportMTU(); got != 1400 {
+		t.Errorf("empty seq_mode: TransportMTU = %d, want 1400", got)
+	}
+
+	// The startup line must show the reduced budget, or a user comparing mtu to
+	// their throughput has no way to see where 12 bytes went.
+	c.Carrier.SeqMode = string(carrier.SeqRealistic)
+	m := attrMap(t, c.EffectiveAttrs())
+	if m["transport_mtu"] != fmt.Sprint(want) {
+		t.Errorf("transport_mtu attr = %q, want %d", m["transport_mtu"], want)
+	}
+}
+
 // TestLogLevelValidation: a typo in log_level used to silently mean info, which
 // could leave a server logging client IPs when the operator asked for none.
 func TestLogLevelValidation(t *testing.T) {

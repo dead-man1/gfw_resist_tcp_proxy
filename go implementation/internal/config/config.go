@@ -219,6 +219,23 @@ func Default() Config {
 	}
 }
 
+// TransportMTU is the payload budget to hand the reliability layer: the
+// configured carrier MTU less any TCP options the carrier itself adds per
+// segment.
+//
+// seq_mode: realistic spends 12 bytes on the timestamp option. Without this
+// subtraction, turning it on would grow every IP packet by 12 bytes, and a path
+// sitting exactly at its MTU would start silently black-holing them (the carrier
+// sets DF). Keeping the wire size identical means switching modes cannot break a
+// link that was working.
+func (c Config) TransportMTU() int {
+	mode, err := carrier.ParseSeqMode(c.Carrier.SeqMode)
+	if err != nil {
+		return c.Carrier.MTU // unvalidated config; Validate reports the real error
+	}
+	return c.Carrier.MTU - carrier.TCPOptionBytes(mode)
+}
+
 // EffectiveAttrs returns the settings that actually took effect, as slog
 // key/value pairs, for a single "this is what I am running with" line at
 // startup. It covers every knob the Windows GUI has no widget for (interface,
@@ -238,6 +255,9 @@ func (c Config) EffectiveAttrs() []any {
 		"transport", string(c.Transport),
 		"interface", c.Carrier.Interface,
 		"mtu", c.Carrier.MTU,
+		// The payload budget after the carrier's own header options, so a shrunken
+		// figure in realistic mode is visible rather than mysterious.
+		"transport_mtu", c.TransportMTU(),
 		"server_port", c.Carrier.ServerPort,
 		"server_port_span", c.Carrier.ServerPortSpan,
 		"tcp_flags", flags.String(),
