@@ -116,17 +116,21 @@ type Carrier struct {
 // established connection: a random ISN, seq advancing by exactly the bytes
 // sent, and an ack that tracks what the peer sent.
 //
-// Overflow: a real stack lets seq wrap modulo 2^32 and both ends follow the
-// wrap. We cannot rely on that here — the peer ignores seq entirely, so nothing
-// re-synchronises after a wrap — and 4 GB of tunnel traffic reaches it in an
-// afternoon. Instead, when the next segment would carry seq past 2^32 we
-// restart the flow at its ISN. To the peer this is invisible (it never looks);
-// to a middlebox it looks like the flow it was tracking rolled over, which is
-// the same class of event as the reconnect it already tolerates.
+// Wrapping at 2^32 needs no special case, and must not have one. Sequence
+// numbers are modulo-2^32 by design (RFC 793): a real connection that transfers
+// more than 4.29 GB rolls over and carries on, and everything that tracks TCP
+// compares sequence numbers with serial arithmetic (RFC 1982, Linux's
+// before()/after(): (int32)(a-b) < 0), for which the rollover is simply the next
+// small forward step. Go's uint32 arithmetic already does exactly this, so
+// s.seq += n is the whole implementation.
+//
+// An earlier version restarted at the ISN on rollover instead. That was a bug:
+// jumping from ~2^32 back to a random ISN is not a wrap, it is a jump of up to
+// 2 GB, which every window-tracking middlebox reads as wildly out of window and
+// drops until the tunnel gives up and reconnects. Do not reintroduce it.
 type seqState struct {
 	mu  sync.Mutex
-	isn uint32 // where this flow started, and where it restarts on overflow
-	seq uint32 // sequence number for the next byte we send
+	seq uint32 // sequence number for the next byte we send; wraps at 2^32
 	ack uint32 // what we ack: the peer's last seq + its payload length
 	// seen is false until the peer's real sequence position is known. Until then
 	// ack holds a plausible guess (see reset); the first inbound packet replaces
@@ -150,9 +154,10 @@ func newSeqState() *seqState {
 	return s
 }
 
-// reset restarts the flow with a fresh ISN. Called when the carrier 4-tuple
-// changes (port rotation on reconnect), because a new tuple is a new connection
-// as far as anything on the path is concerned.
+// reset starts a new flow: fresh ISN, fresh ack guess, fresh timestamp base.
+// Called when the carrier 4-tuple changes (port rotation on reconnect), because a
+// new tuple is a new connection as far as anything on the path is concerned. It is
+// NOT called on sequence rollover — see the type comment.
 //
 // The ack starts at its own random value rather than at 1. We cannot know where
 // the peer's sequence space really is until it sends something (there is no
@@ -167,7 +172,7 @@ func (s *seqState) reset() {
 	// continuing a global counter that would tie our flows together.
 	tsBase, tsEcr, now := rand.Uint32(), rand.Uint32(), time.Now()
 	s.mu.Lock()
-	s.isn, s.seq, s.ack, s.seen = isn, isn, ack, false
+	s.seq, s.ack, s.seen = isn, ack, false
 	s.tsBase, s.tsStart, s.tsEcr, s.tsSeen = tsBase, now, tsEcr, false
 	s.mu.Unlock()
 }
@@ -177,10 +182,9 @@ func (s *seqState) reset() {
 func (s *seqState) next(n uint32) (seq, ack uint32, ts tcpTimestamps) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.seq+n < s.seq { // would carry us past 2^32: restart at the ISN
-		s.seq = s.isn
-	}
 	seq, ack = s.seq, s.ack
+	// Modulo 2^32, exactly as TCP defines it: past 4.29 GB this rolls over and the
+	// stream continues uninterrupted. No special case — see the type comment.
 	s.seq += n
 	// A 1 ms clock, wrapping naturally like a real one. Monotonic within the flow
 	// because tsStart only moves on reset, which redraws tsBase at the same time.

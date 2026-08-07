@@ -214,9 +214,12 @@ carrier:
   That is maximally safe for window-tracking NAT, but a capture makes the tunnel
   obvious. `realistic` makes **both** numbers behave like an established
   connection:
-  - **seq** starts at a random ISN and advances by exactly the bytes sent. On
-    reaching the 32-bit limit the flow restarts at its ISN rather than wrapping
-    (the peer never reads seq, so the restart is invisible to it).
+  - **seq** starts at a random ISN and advances by exactly the bytes sent. Past
+    4.29 GB it **rolls over modulo 2³² and the stream carries on**, which is what
+    TCP has always done and what every middlebox expects: sequence comparisons use
+    serial arithmetic (RFC 1982 — Linux's `before()`/`after()` are
+    `(int32)(a-b) < 0`), for which the rollover is just the next small forward
+    step. The ack follows the peer through its own rollover the same way.
   - **ack** starts at its own random, plausible position — there is no SYN-ACK to
     learn the peer's real ISN from, and an ack of `1` would be the same giveaway
     as a seq of `1`. The first packet from the peer replaces the guess with the
@@ -289,6 +292,26 @@ gfk detects the broken pairing at runtime: after three inbound packets stuck at
 
 If a matched `realistic` pair still dies after ~24 s, some box on the path is
 unhappy in a way we have not modelled: fall back to `fixed`.
+
+#### Why 24 seconds — it was never a 32-bit overflow
+
+Worth spelling out, because the obvious reading of "the sequence ran out" is wrong
+and the mistake is easy to repeat. Sequence numbers are 32-bit: 2³² is **4.29 GB**,
+and burning that in 24 s would take 1.43 Gbps. The number that actually ran out was
+the **16-bit window**, 65535 bytes — and 65535 ÷ 24 s = **2.7 KB/s**, an idle
+tunnel ticking over on keepalives.
+
+The arithmetic closes exactly: the window is ¹⁄₆₅₅₃₆ of the sequence space, at
+2.7 KB/s a true 2³² rollover would take 18.2 days, and 18.2 days ÷ 65536 = 24.0 s.
+
+The mechanism: conntrack allows `peer's_last_ack + peer's_window` and drops the
+rest. In a real connection that ceiling *slides*, because the receiver's ack keeps
+advancing. With a frozen ack it never moves, so you get exactly one window of
+traffic and then that direction goes silent — no reset, no error, packets simply
+stop being forwarded. `fixed` mode is immune because seq never moves (`1 ≤ 65536`
+forever); `realistic` mode is safe because both sides' acks advance and the window
+slides again. Nothing here has anything to do with 2³², which is why the rollover
+now needs no special handling at all — it just wraps, like TCP.
 
 ### How packets are captured (and what it costs)
 

@@ -22,8 +22,9 @@ carrier:
                           #              random ISN with seq growing by the payload length; an ack
                           #              that starts plausible then tracks the server forward-only;
                           #              a window that jitters near 65535; and RFC 7323 timestamps
-                          #              (NOP,NOP,TS) as a real stack sends mid-stream. Restarts at
-                          #              the ISN instead of overflowing. Only the SYN is missing.
+                          #              (NOP,NOP,TS) as a real stack sends mid-stream. Past 4.29 GB
+                          #              the sequence rolls over modulo 2^32 and the stream carries
+                          #              on, exactly as TCP does. Only the SYN is missing.
                           #              Costs 12 header bytes, taken off the payload so the IP
                           #              packet stays exactly mtu+40 either way.
                           # MUST MATCH THE SERVER. Not because gfk reads the peer's numbers (it

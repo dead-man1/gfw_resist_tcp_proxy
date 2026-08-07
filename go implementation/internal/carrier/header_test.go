@@ -240,8 +240,20 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 		t.Errorf("ack = %d, want 100500", ack)
 	}
 
-	// Serial arithmetic: when the peer's own counter restarts (its overflow), the
-	// large backward step reads as forward motion and must be adopted, not ignored.
+	// The ack must follow the peer across ITS 2^32 rollover. This is the mirror of
+	// TestSeqWrapsLikeRealTCP and just as load-bearing: if the forward-only rule
+	// rejected the wrapped value, our ack would freeze at ~2^32 — which is exactly
+	// the frozen-ack condition that gets a flow window-dropped, arriving silently
+	// after 4.29 GB.
+	s = newSeqState()
+	s.observe(0xFFFFFFE0, 16, 0, false) // ack -> 0xFFFFFFF0
+	s.observe(0xFFFFFFF0, 32, 0, false) // peer's stream rolls over: ack -> 0x00000010
+	if _, ack, _ := s.next(1); ack != 0x00000010 {
+		t.Errorf("ack = %#x, want %#x — the ack must follow the peer through the rollover", ack, 0x00000010)
+	}
+
+	// Serial arithmetic: when the peer starts a whole new flow (its own ISN), the
+	// large step reads as forward motion and must be adopted, not ignored.
 	s = newSeqState()
 	s.observe(0xFFFFFF00, 16, 0, false) // ack -> 0xFFFFFF10
 	s.observe(0x20000000, 8, 0, false)  // peer restarted at a fresh ISN
@@ -261,22 +273,107 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 	}
 }
 
-// TestSeqOverflowRestartsAtISN: rather than wrapping past 2^32 (which nothing
-// re-synchronises, since the peer ignores seq), the flow restarts at its ISN.
-func TestSeqOverflowRestartsAtISN(t *testing.T) {
-	s := &seqState{isn: 1000, seq: 1000, ack: 1}
-	s.seq = 0xFFFFFFF0 // 16 bytes of space left before the wrap
+// TestSeqWrapsLikeRealTCP: at 2^32 the sequence rolls over and the stream carries
+// on, exactly as TCP defines it — 4.29 GB into a transfer is not a reason to
+// disturb the flow. The crucial property is the SECOND assertion group: measured
+// in serial arithmetic (RFC 1982), the step across the rollover is just the bytes
+// sent, which is what a window-tracking middlebox sees. An earlier version jumped
+// back to the ISN here, which reads as a multi-gigabyte forward leap and gets the
+// flow dropped as out-of-window.
+func TestSeqWrapsLikeRealTCP(t *testing.T) {
+	s := newSeqState()
+	s.seq = 0xFFFFFFF0 // 16 bytes of sequence space left before the rollover
 
-	if seq, _, _ := s.next(10); seq != 0xFFFFFFF0 {
-		t.Fatalf("seq = %#x, want the pre-wrap value", seq)
+	first, _, _ := s.next(10)  // 0xFFFFFFF0, leaves 0xFFFFFFFA
+	second, _, _ := s.next(10) // 0xFFFFFFFA, leaves 0x00000004 (rolled over)
+	third, _, _ := s.next(10)  // 0x00000004
+
+	for _, c := range []struct {
+		name string
+		got  uint32
+		want uint32
+	}{
+		{"before the rollover", first, 0xFFFFFFF0},
+		{"at the rollover", second, 0xFFFFFFFA},
+		{"after the rollover", third, 0x00000004},
+	} {
+		if c.got != c.want {
+			t.Errorf("seq %s = %#x, want %#x", c.name, c.got, c.want)
+		}
 	}
-	// 0xFFFFFFFA + 10 would wrap: expect a restart at the ISN instead.
-	seq, _, _ := s.next(10)
-	if seq != 1000 {
-		t.Errorf("seq = %#x, want a restart at the ISN (1000)", seq)
+
+	// Continuity is what matters: every step is exactly the bytes sent, including
+	// the one that crosses 2^32.
+	if d := int32(second - first); d != 10 {
+		t.Errorf("step before the rollover = %d, want 10", d)
 	}
-	if next, _, _ := s.next(1); next != 1010 {
-		t.Errorf("seq = %d, want the restarted counter to keep climbing (1010)", next)
+	if d := int32(third - second); d != 10 {
+		t.Errorf("step ACROSS the rollover = %d, want 10 — the wrap must be a normal forward step", d)
+	}
+
+	// And it keeps going afterwards, rather than being a one-off.
+	fourth, _, _ := s.next(1400)
+	if d := int32(fourth - third); d != 10 {
+		t.Errorf("step after the rollover = %d, want 10", d)
+	}
+	if fifth, _, _ := s.next(1); int32(fifth-fourth) != 1400 {
+		t.Errorf("step = %d, want 1400", int32(fifth-fourth))
+	}
+}
+
+// TestSeqRollsOverOnTheWire drives the rollover through the real send path and
+// reads the sequence numbers back off the crafted packets, so the guarantee is
+// checked where it matters rather than only inside seqState.
+func TestSeqRollsOverOnTheWire(t *testing.T) {
+	f := newFakeIO()
+	c := newTestClient(f, SeqRealistic)
+	defer c.Close()
+
+	payload := []byte("0123456789") // 10 bytes per packet
+	c.clientSeq.mu.Lock()
+	c.clientSeq.seq = 0xFFFFFFF5 // 11 bytes short of the rollover
+	c.clientSeq.mu.Unlock()
+
+	var seqs []uint32
+	for i := 0; i < 4; i++ {
+		if _, err := c.WriteTo(payload, c.peer); err != nil {
+			t.Fatal(err)
+		}
+		seqs = append(seqs, parseHeader(t, <-f.sent).seq)
+	}
+
+	want := []uint32{0xFFFFFFF5, 0xFFFFFFFF, 0x00000009, 0x00000013}
+	for i := range want {
+		if seqs[i] != want[i] {
+			t.Errorf("packet %d seq = %#x, want %#x", i, seqs[i], want[i])
+		}
+	}
+	for i := 1; i < len(seqs); i++ {
+		if d := int32(seqs[i] - seqs[i-1]); d != 10 {
+			t.Errorf("packet %d: step = %d, want the 10 bytes sent", i, d)
+		}
+	}
+	t.Logf("on the wire across 2^32: %#x -> %#x -> %#x -> %#x", seqs[0], seqs[1], seqs[2], seqs[3])
+}
+
+// TestSeqSurvivesAFullLap walks the counter all the way around 2^32 and checks it
+// lands where TCP says it should, with no discontinuity anywhere.
+func TestSeqSurvivesAFullLap(t *testing.T) {
+	s := newSeqState()
+	start, _, _ := s.next(0)
+
+	const step = 1 << 20 // 1 MiB at a time: 4096 laps steps == exactly 2^32
+	prev := start
+	for i := 0; i < 1<<12; i++ {
+		s.next(step)
+		cur, _, _ := s.next(0)
+		if d := int32(cur - prev); d != step {
+			t.Fatalf("iteration %d: step = %d, want %d (discontinuity at %#x)", i, d, step, cur)
+		}
+		prev = cur
+	}
+	if prev != start {
+		t.Errorf("after exactly 2^32 bytes seq = %#x, want to be back at the start %#x", prev, start)
 	}
 }
 

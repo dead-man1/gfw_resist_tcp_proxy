@@ -103,8 +103,8 @@ type CarrierConfig struct {
 	//   realistic — BOTH numbers behave like a real established connection: a
 	//               random ISN with seq advancing by the payload length, and an
 	//               ack that starts from a plausible random position and then
-	//               tracks the peer's stream forward-only. Restarts at the ISN
-	//               instead of overflowing 2^32.
+	//               tracks the peer's stream forward-only. Past 4.29 GB both roll
+	//               over modulo 2^32 and carry on, exactly as TCP does.
 	//
 	// MUST MATCH on both ends. gfk never reads the peer's numbers, but a stateful
 	// NAT validates a climbing seq against the peer's ack — and a fixed-mode peer
