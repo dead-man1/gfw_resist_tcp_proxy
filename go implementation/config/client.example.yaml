@@ -18,10 +18,16 @@ carrier:
   seq_mode: fixed         # fixed | realistic — TCP sequence numbers on carrier packets.
                           #   fixed:     seq = ack = 1 always. Safest with window-tracking NAT,
                           #              but a capture makes the tunnel obvious.
-                          #   realistic: random ISN, seq grows by the payload length, ack follows
-                          #              the server, restarting at the ISN instead of overflowing.
-                          # Independent of the server's setting. Try realistic if you suspect
-                          # DPI on the numbers; go back to fixed if the link dies after ~24s.
+                          #   realistic: BOTH seq and ack behave like a real connection — random
+                          #              ISN, seq grows by the payload length, ack starts at a
+                          #              plausible random position then tracks the server's
+                          #              stream (forward-only), restarting at the ISN instead of
+                          #              overflowing. Only the SYN handshake is missing.
+                          # MUST MATCH THE SERVER. Not because gfk reads the peer's numbers (it
+                          # doesn't) but because a stateful NAT checks your climbing seq against
+                          # the peer's ack: a fixed peer acks 1 forever, so ~64 KB later every
+                          # packet you send is out-of-window and dropped (the ~24s death).
+                          # realistic+realistic or fixed+fixed — never one of each.
 
 firewall:
   manage: ask             # ask | yes | no

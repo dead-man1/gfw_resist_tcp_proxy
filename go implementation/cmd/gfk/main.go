@@ -126,6 +126,7 @@ func main() {
 		Interface:      cfg.Carrier.Interface,
 		TCPFlags:       cfg.Carrier.TCPFlags,
 		SeqMode:        cfg.Carrier.SeqMode,
+		Warn:           logger.Warn,
 	})
 	if err != nil {
 		logger.Error("failed to open carrier", "err", err)

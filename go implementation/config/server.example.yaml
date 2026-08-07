@@ -19,10 +19,15 @@ carrier:
                           # Need NOT match the client (each side only crafts its own packets).
   seq_mode: fixed         # fixed | realistic — TCP sequence numbers on carrier packets.
                           #   fixed:     seq = ack = 1 always. Safest with window-tracking NAT.
-                          #   realistic: random ISN per client, seq grows by the payload length,
-                          #              ack follows that client, restarting at the ISN instead
-                          #              of overflowing.
-                          # Need NOT match the client (neither side reads the other's numbers).
+                          #   realistic: BOTH seq and ack behave like a real connection, tracked
+                          #              per client: random ISN, seq grows by the payload length,
+                          #              ack tracks that client's stream forward-only, restarting
+                          #              at the ISN instead of overflowing.
+                          # MUST MATCH THE CLIENT. Not because gfk reads the peer's numbers (it
+                          # doesn't) but because a stateful NAT checks a climbing seq against the
+                          # peer's ack: a fixed peer acks 1 forever, so ~64 KB later that
+                          # direction is out-of-window and dropped (the ~24s death).
+                          # realistic+realistic or fixed+fixed — never one of each.
 
 firewall:
   manage: ask             # ask | yes | no  (use "yes" under systemd)

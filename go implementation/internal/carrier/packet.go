@@ -62,9 +62,10 @@ func addrFromNet(a net.Addr) (net.IP, uint16, bool) {
 // would eventually exceed the peer's ~64 KB window (the ack cannot advance,
 // since there is no real handshake), and the middlebox would start dropping
 // that direction — observed in the field as the return path dying at ~24s.
-// seq_mode: realistic avoids that trap differently: seq advances by payload
-// length AND the ack mirrors what the peer sent, so the pair stays consistent
-// the way a real stream's does. See seqState in carrier.go.
+// seq_mode: realistic escapes that trap differently: seq advances by payload
+// length AND the ack tracks what the peer sent, so each side's ack keeps raising
+// the window ceiling the other side's seq is checked against. That only holds if
+// BOTH ends run realistic — see seqState.checkPeerSeqMode in carrier.go.
 const (
 	carrierSeq = 1
 	carrierAck = 1

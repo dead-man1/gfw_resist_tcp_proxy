@@ -100,9 +100,15 @@ type CarrierConfig struct {
 	// SeqMode selects the TCP sequence numbers of crafted segments:
 	//   fixed     — seq = ack = 1 on every packet (default). Safest for
 	//               window-tracking NAT, but obvious to anyone reading a capture.
-	//   realistic — random ISN, seq advances by the payload length, ack follows
-	//               the peer, with a restart at the ISN instead of a 32-bit
-	//               overflow. Independent per side.
+	//   realistic — BOTH numbers behave like a real established connection: a
+	//               random ISN with seq advancing by the payload length, and an
+	//               ack that starts from a plausible random position and then
+	//               tracks the peer's stream forward-only. Restarts at the ISN
+	//               instead of overflowing 2^32.
+	//
+	// MUST MATCH on both ends. gfk never reads the peer's numbers, but a stateful
+	// NAT validates a climbing seq against the peer's ack — and a fixed-mode peer
+	// acks 1 forever, so a realistic/fixed pairing dies one ~64 KB window in.
 	SeqMode string `yaml:"seq_mode"`
 }
 

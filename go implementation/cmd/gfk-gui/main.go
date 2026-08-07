@@ -787,6 +787,7 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		Interface:      cfg.Carrier.Interface,
 		TCPFlags:       cfg.Carrier.TCPFlags,
 		SeqMode:        cfg.Carrier.SeqMode,
+		Warn:           logger.Warn,
 	})
 	if err != nil {
 		cancel()

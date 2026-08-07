@@ -187,16 +187,97 @@ carrier:
   the header stays a combination a real stack could emit.
 - `carrier.seq_mode` — `fixed` (default) pins seq and ack to 1 on every packet.
   That is maximally safe for window-tracking NAT, but a capture makes the tunnel
-  obvious. `realistic` starts from a random ISN, advances seq by the payload
-  length, and acks what the peer actually sent — the pair stays consistent the
-  way a real stream's does, and on reaching the 32-bit limit the flow restarts at
-  its ISN instead of wrapping (the peer never reads seq, so the restart is
-  invisible to it). Port rotation also starts a fresh ISN, since the new 4-tuple
-  is a new connection to everything on the path.
+  obvious. `realistic` makes **both** numbers behave like an established
+  connection:
+  - **seq** starts at a random ISN and advances by exactly the bytes sent. On
+    reaching the 32-bit limit the flow restarts at its ISN rather than wrapping
+    (the peer never reads seq, so the restart is invisible to it).
+  - **ack** starts at its own random, plausible position — there is no SYN-ACK to
+    learn the peer's real ISN from, and an ack of `1` would be the same giveaway
+    as a seq of `1`. The first packet from the peer replaces the guess with the
+    truth, and from then on the ack only ever moves forward, exactly like a real
+    cumulative ack (a reordered or retransmitted segment cannot pull it back).
+  - Port rotation starts a fresh ISN and a fresh guess, since the new 4-tuple is a
+    new connection to everything on the path.
 
-Neither setting has to match on the other end — each side only crafts its own
-packets and ignores the peer's numbers and flags. If a link starts dying after
-~24 s on `realistic`, a window-tracking middlebox is unhappy: go back to `fixed`.
+  A dump of a live `realistic` flow (client side), before and after the server
+  first speaks:
+
+      seq=205754368  ack=964942046   len=5     <- ack is the plausible guess
+      seq=205754373  ack=964942046   len=14
+      ... server sends 40 bytes at seq 3221225472 ...
+      seq=205754387  ack=3221225512  len=1     <- ack = peer seq + 40, the truth
+      seq=205754388  ack=3221225512  len=1     <- a late server packet cannot regress it
+      seq=205754389  ack=3221225522  len=1
+
+  What `realistic` still does **not** disguise: the absent SYN handshake (by
+  design — it is the whole point), a constant 65535 window, and a bare 20-byte TCP
+  header with no options, where a real Linux or Windows peer would usually carry
+  timestamps and SACK. A DPI comparing against a genuine stack can still tell.
+
+`tcp_flags` genuinely does not have to match: each side crafts its own packets and
+the receiver accepts any flags but SYN.
+
+**`seq_mode` DOES have to match** — this is the one that bites. gfk ignores the
+peer's numbers, but a stateful NAT does not. It validates your climbing seq
+against *the peer's last ack plus the peer's window*; a `fixed` peer acks `1`
+forever, so that ceiling never rises, and one window later (65535 bytes — about
+24 s on a slow link, which is exactly the failure this project already hit) every
+packet you send is out-of-window and dropped. Realistic mode is safe **only**
+because a realistic peer's ack advances to cover what you sent. So:
+
+| client | server | result |
+|---|---|---|
+| `fixed` | `fixed` | safest, and the default. Obvious in a capture. |
+| `realistic` | `realistic` | looks like a real stream, and the acks keep each other in-window. |
+| `realistic` | `fixed` (either way round) | **broken** — dies one 64 KB window in. |
+
+gfk detects the broken pairing at runtime: after three inbound packets stuck at
+`seq=1` it logs
+
+    peer looks like seq_mode: fixed while this side is realistic — set seq_mode
+    the same on both ends, or a stateful NAT will drop this direction about one
+    64 KB window from now
+
+If a matched `realistic` pair still dies after ~24 s, some box on the path is
+unhappy in a way we have not modelled: fall back to `fixed`.
+
+### How packets are captured (and what it costs)
+
+There is **no kernel-level filter**. Linux binds `AF_PACKET`/`SOCK_DGRAM` with
+`ETH_P_IP` to the NIC, Windows opens Npcap in promiscuous mode with no BPF
+program, so *every* IPv4 packet on the interface is copied to userspace. The
+carrier then decides in Go, per packet, in this order:
+
+1. parse as IPv4+TCP — anything else is dropped;
+2. drop if **SYN** is set (not carrier data) or the payload is empty;
+3. **port match** — server: destination port inside `[server_port,
+   server_port+server_port_span)`; client: source IP/port must be the VPS and the
+   destination port the current rotated client port.
+
+So the port span is a userspace comparison, not a capture filter, and no TCP flag
+other than SYN takes part in the decision. Measured on an i5-13420H:
+
+| per packet | cost | allocations |
+|---|---|---|
+| parse + reject (not our port) | ~370 ns | 1216 B |
+| parse + accept + hand to transport | ~1.1 µs | 2808 B |
+| craft + serialize an outbound packet | ~1.6 µs | 5504 B |
+
+That is ~2.7 M rejected packets/s per core, so at ordinary VPS rates the capture
+is not the bottleneck: 100 Mbps of unrelated traffic (~9 k pkt/s) costs well under
+1% of a core, and the accept path sustains ~875 k pkt/s (≈9 Gbps at mtu 1400).
+Two caveats worth knowing:
+
+- The cost scales with **packets per second on the whole interface**, not with
+  tunnel throughput. A small-packet flood (≥500 k pkt/s) on a busy VPS will burn
+  real CPU parsing packets that are then discarded.
+- The allocation volume matters more than the CPU: ~1.2 KB of garbage per captured
+  packet is GC pressure at high rates. Attaching a real BPF filter (the unused
+  `bpfFilter` sketch in `packetio.go`) or hand-rolling the 20-byte header parse
+  would remove nearly all of it. Neither is needed at current speeds.
+
+Run the numbers yourself with `go test ./internal/carrier/ -bench . -run XXX`.
 
 ### Restricting destination ports (server)
 

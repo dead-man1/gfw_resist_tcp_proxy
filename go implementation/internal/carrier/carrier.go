@@ -37,9 +37,18 @@ type Options struct {
 	// and rejects syn/rst.
 	TCPFlags []string
 	// SeqMode is config carrier.seq_mode: "fixed" (seq/ack pinned to 1) or
-	// "realistic". Empty = fixed. Each side chooses independently — the peer
-	// never inspects these numbers.
+	// "realistic". Empty = fixed.
+	//
+	// gfk itself never inspects the peer's numbers, but "realistic" still has to
+	// MATCH on both ends: a climbing seq only stays inside a stateful NAT's window
+	// because the peer's ack keeps advancing to cover it. Point realistic at a
+	// fixed peer and that direction dies once it is a window past the peer's
+	// frozen ack. Open wires Warn to catch it at runtime.
 	SeqMode string
+	// Warn, if set, reports a non-fatal runtime problem (currently: a peer whose
+	// seq_mode disagrees with ours). Signature matches slog.Logger.Warn so a
+	// caller can pass it straight through.
+	Warn func(msg string, args ...any)
 }
 
 // rxPacket is one received carrier payload plus its source peer.
@@ -80,11 +89,16 @@ type Carrier struct {
 	// the sequence numbers evolve. Both are parsed once, in Open.
 	tcpFlags TCPFlags
 	seqMode  SeqMode
+	warn     func(msg string, args ...any) // optional; see Options.Warn
 	// clientSeq is the single sequence state of the client role; peerSeq holds one
 	// *seqState per client for the server role (addr string -> *seqState). Only
 	// used when seqMode is SeqRealistic.
 	clientSeq *seqState
 	peerSeq   sync.Map
+	// fixedPeerHits counts consecutive inbound packets that carry the fixed-mode
+	// constant seq; warnedPeerFixed makes the resulting warning fire once.
+	fixedPeerHits   atomic.Uint32
+	warnedPeerFixed atomic.Bool
 
 	bytesIn  atomic.Uint64
 	bytesOut atomic.Uint64
@@ -114,6 +128,10 @@ type seqState struct {
 	isn uint32 // where this flow started, and where it restarts on overflow
 	seq uint32 // sequence number for the next byte we send
 	ack uint32 // what we ack: the peer's last seq + its payload length
+	// seen is false until the peer's real sequence position is known. Until then
+	// ack holds a plausible guess (see reset); the first inbound packet replaces
+	// it outright, and from then on the ack only ever moves forward.
+	seen bool
 }
 
 func newSeqState() *seqState {
@@ -125,10 +143,17 @@ func newSeqState() *seqState {
 // reset restarts the flow with a fresh ISN. Called when the carrier 4-tuple
 // changes (port rotation on reconnect), because a new tuple is a new connection
 // as far as anything on the path is concerned.
+//
+// The ack starts at its own random value rather than at 1. We cannot know where
+// the peer's sequence space really is until it sends something (there is no
+// SYN-ACK to learn it from), and an ack of 1 on an otherwise mid-stream segment
+// is exactly the tell realistic mode exists to remove. The guess is only ever on
+// the wire until the peer's first packet arrives — one RTT — after which every
+// ack we send is the truth.
 func (s *seqState) reset() {
-	isn := randomISN()
+	isn, ack := randomISN(), randomISN()
 	s.mu.Lock()
-	s.isn, s.seq, s.ack = isn, isn, carrierAck
+	s.isn, s.seq, s.ack, s.seen = isn, isn, ack, false
 	s.mu.Unlock()
 }
 
@@ -145,17 +170,25 @@ func (s *seqState) next(n uint32) (seq, ack uint32) {
 	return seq, ack
 }
 
-// observe records an inbound segment so our next ack reflects it, the way a
-// receiver's would. Reordered packets can walk the ack backwards; that costs
-// nothing, since the peer never reads it and no retransmission logic hangs off
-// it (KCP/QUIC above us own reliability).
+// observe records an inbound segment so our next ack reflects it, the way a real
+// receiver's would.
+//
+// The first inbound packet replaces the guess from reset outright — it must, or a
+// guess that happens to sit "after" the peer's real position would freeze the ack
+// there, which is the frozen-ack situation that gets a flow window-dropped.
+// After that the ack only advances: a real cumulative ack never regresses, so a
+// reordered or retransmitted packet must not walk it backwards. The comparison is
+// serial-number arithmetic (RFC 1982), so it stays correct across a 2^32 wrap and
+// treats the peer's own overflow restart as forward motion.
 func (s *seqState) observe(peerSeq uint32, payloadLen int) {
 	ack := peerSeq + uint32(payloadLen)
 	if ack == 0 {
 		ack = 1 // ack 0 does not occur in an established stream
 	}
 	s.mu.Lock()
-	s.ack = ack
+	if !s.seen || int32(ack-s.ack) > 0 {
+		s.ack, s.seen = ack, true
+	}
 	s.mu.Unlock()
 }
 
@@ -163,7 +196,38 @@ func (s *seqState) observe(peerSeq uint32, payloadLen int) {
 // unpredictable; math/rand/v2 is seeded from the OS and is plenty, since nothing
 // security-relevant rests on it (the payload is encrypted by the transport).
 func randomISN() uint32 {
-	return rand.Uint32N(1 << 31) // stay in the low half: room to climb before a wrap
+	// Stay in the low half: room to climb before a wrap. Never 0 — a real stream
+	// does not sit at sequence 0, and it is the one value that would look planted.
+	return 1 + rand.Uint32N(1<<31)
+}
+
+// checkPeerSeqMode warns once if the peer is evidently running seq_mode: fixed
+// while we run realistic — the one combination that is worse than either mode on
+// its own.
+//
+// Why it matters: a stateful NAT (Linux conntrack and friends) validates our
+// climbing seq against the peer's last ack plus the peer's advertised window. A
+// fixed-mode peer acks 1 forever, so that ceiling never moves; roughly one window
+// of traffic later — 64 KB, which is ~24 s on a slow link — every packet we send
+// is out-of-window and gets dropped. That is the exact failure this project hit
+// before fixed mode existed. Realistic mode escapes it only because a realistic
+// peer's ack advances to cover what we sent, so both ends must agree.
+func (c *Carrier) checkPeerSeqMode(peerSeq uint32) {
+	if c.warn == nil || c.warnedPeerFixed.Load() {
+		return
+	}
+	if peerSeq != carrierSeq {
+		c.fixedPeerHits.Store(0)
+		return
+	}
+	// Three inbound packets all sitting at seq==1 is a fixed-mode peer, not a
+	// coincidence: a realistic peer draws a random ISN and advances it with every
+	// payload byte, so it cannot stay there.
+	if c.fixedPeerHits.Add(1) >= 3 && c.warnedPeerFixed.CompareAndSwap(false, true) {
+		c.warn("peer looks like seq_mode: fixed while this side is realistic — " +
+			"set seq_mode the same on both ends, or a stateful NAT will drop this direction " +
+			"about one 64 KB window from now")
+	}
 }
 
 // seqFor returns the sequence state for a peer: the single client-side state, or
@@ -268,6 +332,7 @@ func Open(opts Options) (*Carrier, error) {
 		localIP:  localIP,
 		tcpFlags: flags,
 		seqMode:  seqMode,
+		warn:     opts.Warn,
 		rx:       make(chan rxPacket, 1024),
 		closed:   make(chan struct{}),
 	}
@@ -411,6 +476,7 @@ func (c *Carrier) recvLoop() {
 		// stay consistent with the stream a middlebox is watching.
 		if c.seqMode == SeqRealistic {
 			c.seqFor(addr).observe(seg.seq, len(seg.payload))
+			c.checkPeerSeqMode(seg.seq)
 		}
 
 		payload := make([]byte, len(seg.payload))

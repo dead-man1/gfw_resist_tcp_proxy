@@ -175,8 +175,13 @@ func TestRealisticSeqAdvancesAndAcks(t *testing.T) {
 	if h1.seq == carrierSeq {
 		t.Error("realistic mode should not start at the fixed seq of 1")
 	}
-	if h1.ack != carrierAck {
-		t.Errorf("ack before any inbound packet = %d, want %d", h1.ack, carrierAck)
+	// Neither number may be the tell-tale 1 before the peer has spoken: at that
+	// point the ack is a plausible guess, not a placeholder.
+	if h1.ack == carrierAck {
+		t.Error("ack before any inbound packet should be a random plausible value, not 1")
+	}
+	if h1.ack != h2.ack || h2.ack != h3.ack {
+		t.Errorf("the guessed ack should be stable until the peer speaks: %d, %d, %d", h1.ack, h2.ack, h3.ack)
 	}
 
 	// Feed an inbound segment: the next ack must cover its last byte.
@@ -199,6 +204,60 @@ func TestRealisticSeqAdvancesAndAcks(t *testing.T) {
 	c.RotateClientPort()
 	if after := send("f").seq; after == before+1 {
 		t.Error("port rotation should restart the sequence with a fresh ISN")
+	}
+}
+
+// TestAckIsRealisticFromTheFirstPacket: in realistic mode the ack must never be
+// the placeholder 1, must adopt the peer's real position as soon as one packet
+// arrives (whichever side of the guess it falls on), and must then only advance —
+// a real cumulative ack never regresses.
+func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
+	// The guess must be replaced even when it sits "after" the peer's real
+	// position, or the ack would freeze and the flow would look stuck. Both
+	// directions of that comparison are exercised here.
+	for _, peerSeq := range []uint32{5, 1 << 30, 0xFFFFFF00} {
+		s := newSeqState()
+		guess := s.ack
+		if guess == carrierAck {
+			t.Fatal("a fresh flow should not ack 1")
+		}
+		s.observe(peerSeq, 10)
+		if _, ack := s.next(1); ack != peerSeq+10 {
+			t.Errorf("peer_seq=%d: ack = %d, want %d (guess was %d)", peerSeq, ack, peerSeq+10, guess)
+		}
+	}
+
+	// Forward motion only: a reordered/retransmitted earlier segment must not
+	// pull the ack back.
+	s := newSeqState()
+	s.observe(100000, 100) // ack -> 100100
+	s.observe(90000, 100)  // an older segment arriving late
+	if _, ack := s.next(1); ack != 100100 {
+		t.Errorf("ack = %d, want it to stay at 100100; a cumulative ack never regresses", ack)
+	}
+	s.observe(100100, 400) // genuinely new data
+	if _, ack := s.next(1); ack != 100500 {
+		t.Errorf("ack = %d, want 100500", ack)
+	}
+
+	// Serial arithmetic: when the peer's own counter restarts (its overflow), the
+	// large backward step reads as forward motion and must be adopted, not ignored.
+	s = newSeqState()
+	s.observe(0xFFFFFF00, 16) // ack -> 0xFFFFFF10
+	s.observe(0x20000000, 8)  // peer restarted at a fresh ISN
+	if _, ack := s.next(1); ack != 0x20000008 {
+		t.Errorf("ack = %#x, want %#x after the peer restarted", ack, 0x20000008)
+	}
+
+	// A fixed-mode flow is unaffected: still the constant pair.
+	f := newFakeIO()
+	c := newTestClient(f, SeqFixed)
+	defer c.Close()
+	if _, err := c.WriteTo([]byte("x"), c.peer); err != nil {
+		t.Fatal(err)
+	}
+	if h := parseHeader(t, <-f.sent); h.seq != carrierSeq || h.ack != carrierAck {
+		t.Errorf("fixed mode: seq/ack = %d/%d, want 1/1", h.seq, h.ack)
 	}
 }
 
