@@ -62,7 +62,7 @@ kcp:
 server:
   backend_ip: "127.0.0.1" # where forwarded connections are dialed (e.g. local xray)
   allow_socks5: false     # true = let clients dial arbitrary targets (SOCKS mode)
-  allowed_ports: []       # restrict destination ports, e.g. [443, 2096, 2052]. Empty = any port.
+  allowed_ports: []       # restrict destination ports, e.g. [443, 2096, 2052]. Empty = allow any port.
 
 # none | error | warn | info | debug
 #   none  = log nothing at all: no client IP is ever written to the log
