@@ -6,6 +6,19 @@
 // below the firewall).
 package firewall
 
+// Fwmark is the netfilter mark gfk sets on its own outbound carrier packets.
+//
+// It exists to resolve a conflict: the Linux rules drop every outbound RST from
+// the carrier ports (that is the whole point — the kernel would otherwise reset
+// our socket-less flow), but gfk itself needs to send one deliberate RST to clear
+// stale middlebox state when it releases a carrier tuple (Carrier.SendReset). The two
+// are indistinguishable by header alone, so the sender marks its packets and the
+// drop rule is preceded by an accept for that mark.
+//
+// Linux only; ignored on other platforms. The value is arbitrary — "gf" in
+// ASCII — chosen to be unlikely to collide with an existing policy-routing rule.
+const Fwmark = 0x6766
+
 // Rules describes the carrier TCP port range to protect from the kernel.
 type Rules struct {
 	// PortStart..PortEnd (inclusive) is the carrier port range this side owns:

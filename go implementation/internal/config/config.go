@@ -110,6 +110,16 @@ type CarrierConfig struct {
 	// NAT validates a climbing seq against the peer's ack — and a fixed-mode peer
 	// acks 1 forever, so a realistic/fixed pairing dies one ~64 KB window in.
 	SeqMode string `yaml:"seq_mode"`
+	// SendResetAndWaitBeforeConnect ("yes" or "no", default "no") additionally sends
+	// a reset and waits 12s before EVERY connect attempt.
+	//
+	// The client always resets a tuple when it lets go of it — session lost, connect
+	// attempt failed, or shutdown — which keeps tuples clean at no cost, because the
+	// middlebox's close timer runs while gfk is busy elsewhere. This option is the
+	// recovery path for a tuple poisoned by something that never released it (an
+	// older build, a crash, a kill -9). It is off by default because the 12s wait is
+	// paid on every attempt: turn it on, get connected, turn it off.
+	SendResetAndWaitBeforeConnect string `yaml:"send_reset_and_wait_before_connect"`
 }
 
 // FirewallConfig controls RST suppression.
@@ -126,14 +136,14 @@ type AuthConfig struct {
 // KCPConfig mirrors kcp-go's tunables plus the smux flow-control windows.
 // See the profiles in config/*.example.yaml and GO.md for per-line-speed values.
 type KCPConfig struct {
-	NoDelay   int `yaml:"nodelay"`   // 1 = low-latency mode (fast flush/ACK); 0 = normal
-	Interval  int `yaml:"interval"`  // internal update period, ms (10 responsive .. 40 low-CPU)
-	Resend    int `yaml:"resend"`    // fast-retransmit after N duplicate ACKs (0 = off)
-	NC        int `yaml:"nc"`        // 0 = congestion control ON (adaptive); 1 = OFF (aggressive)
-	SndWnd    int `yaml:"sndwnd"`    // send window, packets (max in-flight sent)
-	RcvWnd    int `yaml:"rcvwnd"`    // receive window, packets. Throughput ~= window*mtu/RTT
-	FECData   int `yaml:"fec_data"`  // Reed-Solomon data shards; 0 = FEC off
-	FECParity int `yaml:"fec_parity"`// parity shards recovered per group (must match both ends)
+	NoDelay   int `yaml:"nodelay"`    // 1 = low-latency mode (fast flush/ACK); 0 = normal
+	Interval  int `yaml:"interval"`   // internal update period, ms (10 responsive .. 40 low-CPU)
+	Resend    int `yaml:"resend"`     // fast-retransmit after N duplicate ACKs (0 = off)
+	NC        int `yaml:"nc"`         // 0 = congestion control ON (adaptive); 1 = OFF (aggressive)
+	SndWnd    int `yaml:"sndwnd"`     // send window, packets (max in-flight sent)
+	RcvWnd    int `yaml:"rcvwnd"`     // receive window, packets. Throughput ~= window*mtu/RTT
+	FECData   int `yaml:"fec_data"`   // Reed-Solomon data shards; 0 = FEC off
+	FECParity int `yaml:"fec_parity"` // parity shards recovered per group (must match both ends)
 	// StreamBuffer / SessionBuffer are the smux flow-control windows in BYTES:
 	// per-connection and whole-tunnel. Single-connection throughput is capped at
 	// StreamBuffer/RTT. 0 = defaults (4 MB / 16 MB). Raise both for >100 Mbps links.
@@ -187,25 +197,26 @@ func Default() Config {
 		Mode:      ModeClient,
 		Transport: TransportKCP,
 		Carrier: CarrierConfig{
-			ServerPort:     45000,
-			ClientPort:     40000,
-			ClientPortSpan: 8,
-			ServerPortSpan: 8,
-			MTU:            1400,
-			TCPFlags:       []string{"ack", "psh"},
-			SeqMode:        string(carrier.SeqFixed),
+			ServerPort:                    45000,
+			ClientPort:                    40000,
+			ClientPortSpan:                8,
+			ServerPortSpan:                8,
+			MTU:                           1400,
+			TCPFlags:                      []string{"ack", "psh"},
+			SeqMode:                       string(carrier.SeqFixed),
+			SendResetAndWaitBeforeConnect: "no",
 		},
 		Firewall: FirewallConfig{Manage: FirewallAsk},
 		Auth:     AuthConfig{Key: "change-me"},
 		KCP: KCPConfig{
-			NoDelay:   1,
-			Interval:  10,
-			Resend:    2,
-			NC:        1, // no congestion control = KCP's normal mode (nc=0/CC underperforms on this carrier)
-			SndWnd:    128, // ~BDP for a slow link; bounds bufferbloat. Raise for faster links (see profiles)
-			RcvWnd:    128,
-			FECData:   0, // FEC off by default (saves ~30% bandwidth); enable on lossy links
-			FECParity: 0,
+			NoDelay:       1,
+			Interval:      10,
+			Resend:        2,
+			NC:            1,   // no congestion control = KCP's normal mode (nc=0/CC underperforms on this carrier)
+			SndWnd:        128, // ~BDP for a slow link; bounds bufferbloat. Raise for faster links (see profiles)
+			RcvWnd:        128,
+			FECData:       0, // FEC off by default (saves ~30% bandwidth); enable on lossy links
+			FECParity:     0,
 			StreamBuffer:  0, // 0 = auto-size smux buffers from the KCP window
 			SessionBuffer: 0,
 		},
@@ -214,9 +225,28 @@ func Default() Config {
 			KeepAliveSeconds: 4,
 			ReconnectSeconds: 2,
 		},
-		Server: ServerConfig{BackendIP: "127.0.0.1"},
+		Server:   ServerConfig{BackendIP: "127.0.0.1"},
 		LogLevel: "info",
 	}
+}
+
+// ResetAndWaitBeforeConnect reports whether send_reset_and_wait_before_connect is
+// on. Validate has already rejected anything unrecognised.
+func (c Config) ResetAndWaitBeforeConnect() bool {
+	on, _ := parseYesNo(c.Carrier.SendResetAndWaitBeforeConnect)
+	return on
+}
+
+// parseYesNo reads a yes/no config value. Empty means no. true/false are accepted
+// too, since YAML users reach for them by reflex.
+func parseYesNo(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "no", "false", "n":
+		return false, nil
+	case "yes", "true", "y":
+		return true, nil
+	}
+	return false, fmt.Errorf("want yes or no, got %q", s)
 }
 
 // TransportMTU is the payload budget to hand the reliability layer: the
@@ -268,6 +298,7 @@ func (c Config) EffectiveAttrs() []any {
 		a = append(a,
 			"client_port", c.Carrier.ClientPort,
 			"client_port_span", c.Carrier.ClientPortSpan,
+			"reset_and_wait_before_connect", c.ResetAndWaitBeforeConnect(),
 			"keepalive_s", c.Client.KeepAliveSeconds,
 			"reconnect_s", c.Client.ReconnectSeconds,
 		)
@@ -362,6 +393,9 @@ func (c *Config) Validate() error {
 	}
 	if _, err := logx.ParseLevel(c.LogLevel); err != nil {
 		return fmt.Errorf("log_level: %w", err)
+	}
+	if _, err := parseYesNo(c.Carrier.SendResetAndWaitBeforeConnect); err != nil {
+		return fmt.Errorf("carrier.send_reset_and_wait_before_connect: %w", err)
 	}
 	if strings.TrimSpace(c.Auth.Key) == "" {
 		return fmt.Errorf("auth.key is required")

@@ -1,6 +1,7 @@
 package carrier
 
 import (
+	"context"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -49,6 +50,12 @@ type Options struct {
 	// seq_mode disagrees with ours). Signature matches slog.Logger.Warn so a
 	// caller can pass it straight through.
 	Warn func(msg string, args ...any)
+	// ResetAndWaitBeforeConnect additionally resets and then blocks for resetWait
+	// before every connect attempt. Off by default: SendReset on release already
+	// keeps tuples clean without stalling, and this stalls every attempt. It is the
+	// recovery path for a tuple poisoned by something else — an older build, a
+	// crash, a kill -9 — where no release-time reset was ever sent.
+	ResetAndWaitBeforeConnect bool
 }
 
 // rxPacket is one received carrier payload plus its source peer.
@@ -422,6 +429,92 @@ func (c *Carrier) RotateServerPort() uint16 {
 	c.curServerPort.Store(next)
 	c.resetSeq()
 	return uint16(next)
+}
+
+// resetWait is how long ResetAndWait blocks after its reset.
+//
+// A reset does not delete a middlebox's entry outright: it moves it to a closing
+// state that expires on its own timer (Linux: nf_conntrack_tcp_timeout_close, 10s
+// by default) and only then goes away. Reuse the tuple inside that window and the
+// entry is still there to reject you — and since each attempt would send another
+// reset, a short wait means the tunnel never connects at all. 12s clears the
+// common 10s timer with margin. Fixed rather than configurable: the useful values
+// are "long enough" or "do not do this", and the release-time resets below make
+// the whole path unnecessary in normal operation.
+const resetWait = 12 * time.Second
+
+// SendReset emits a standalone TCP RST on the carrier 4-tuple currently in use and
+// returns immediately. Client role only; on the server it is a no-op.
+//
+// This is how gfk releases a tuple: it is sent when a session ends, when a connect
+// attempt fails, and at shutdown — never before using a tuple, and never during a
+// live session. The point of resetting on release is timing. A middlebox keeps its
+// entry for the carrier flow long after a session ends (Linux's ESTABLISHED
+// timeout is five days) and that entry remembers the old session's sequence
+// window. A new session in seq_mode: realistic opens at a fresh random ISN, lands
+// nowhere near what the stale entry expects, and every packet is dropped — the
+// tuple stays dead across restarts of both ends, because the state is in the
+// middle, not in either endpoint. Resetting as we let go of the tuple starts the
+// middlebox's close timer immediately, so by the time the port rotation comes back
+// around to it, it is long gone. Resetting just before reuse would instead force us
+// to sit out that timer (see resetWait).
+//
+// The packet is what a kernel emits to reject an unknown connection: RST alone, no
+// ACK flag, seq and ack at 1, zero window, no options, no payload. Sent in both seq
+// modes — fixed mode does not need it, but it is harmless there.
+func (c *Carrier) SendReset() error {
+	if c.opts.Role != RoleClient {
+		return nil
+	}
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+
+	pkt, err := craftSegment(segmentSpec{
+		srcIP: c.localIP, dstIP: c.opts.VPSIP,
+		srcPort: uint16(c.curClientPort.Load()),
+		dstPort: uint16(c.curServerPort.Load()),
+		seq:     carrierSeq,
+		ack:     carrierAck,
+		flags:   TCPFlags{RST: true},
+	})
+	if err != nil {
+		return err
+	}
+	if err := c.pio.Inject(pkt); err != nil {
+		return err
+	}
+	// Deliberately not counted in bytesOut: this is path maintenance, not tunnel
+	// traffic, and it would skew the throughput readout.
+	return nil
+}
+
+// ResetAndWait sends a reset and then blocks for resetWait, so the tuple is clean
+// before it is reused. No-op unless Options.ResetAndWaitBeforeConnect.
+//
+// This is the recovery path, not the normal one: it exists for a tuple poisoned by
+// something that never got to release it — an older build, a crash, a kill -9 — and
+// it costs resetWait on every connect attempt. It returns early if ctx is
+// cancelled, so shutdown is not held up by the wait.
+func (c *Carrier) ResetAndWait(ctx context.Context) error {
+	if c.opts.Role != RoleClient || !c.opts.ResetAndWaitBeforeConnect {
+		return nil
+	}
+	if err := c.SendReset(); err != nil {
+		return err
+	}
+	t := time.NewTimer(resetWait)
+	defer t.Stop()
+	select {
+	case <-t.C:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return net.ErrClosed
+	}
+	return nil
 }
 
 // resetSeq starts a fresh sequence flow on the client after a port rotation: the

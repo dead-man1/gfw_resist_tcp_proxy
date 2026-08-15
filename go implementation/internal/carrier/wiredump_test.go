@@ -74,6 +74,27 @@ func TestDumpRealisticStream(t *testing.T) {
 	}
 }
 
+// TestDumpReleaseReset prints the reset gfk sends when it releases a tuple, in a
+// form that can be compared against a capture.
+func TestDumpReleaseReset(t *testing.T) {
+	f := newFakeIO()
+	c := newTestClient(f, SeqRealistic)
+	defer c.Close()
+
+	if err := c.SendReset(); err != nil {
+		t.Fatal(err)
+	}
+	pkt := <-f.sent
+	seg, _ := parseIPv4(pkt)
+	h := parseHeader(t, pkt)
+
+	t.Logf("IP  %v -> %v  (%d bytes total, %d IP header)", seg.srcIP, seg.dstIP, len(pkt), int(pkt[0]&0x0f)*4)
+	t.Logf("TCP %d -> %d  flags=%06b (R only)  seq=%d ack=%d win=%d optlen=%d payload=%d",
+		seg.srcPort, seg.dstPort, h.flags&0x3f, h.seq, h.ack,
+		tcpWindow(t, pkt), len(tcpOptions(t, pkt)), len(seg.payload))
+	t.Logf("raw % x", pkt)
+}
+
 // TestDumpFixedStream is the same exchange in the default mode, for contrast:
 // constant numbers, constant window, no options at all.
 func TestDumpFixedStream(t *testing.T) {

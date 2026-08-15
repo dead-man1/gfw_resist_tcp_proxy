@@ -221,6 +221,60 @@ func TestTransportMTU(t *testing.T) {
 	}
 }
 
+// TestSendResetAndWaitBeforeConnect: the one knob left for the reset. It must
+// default to off — it stalls 12s on every attempt — and read the yes/no vocabulary
+// the rest of the config uses.
+func TestSendResetAndWaitBeforeConnect(t *testing.T) {
+	if Default().ResetAndWaitBeforeConnect() {
+		t.Error("must default to off: it costs 12s per connect attempt")
+	}
+
+	on := map[string]bool{
+		"":      false, // absent from the file
+		"no":    false,
+		"No":    false,
+		"false": false,
+		"n":     false,
+		"yes":   true,
+		"YES":   true,
+		" yes ": true,
+		"true":  true,
+		"y":     true,
+	}
+	for in, want := range on {
+		c := validServer()
+		c.Carrier.SendResetAndWaitBeforeConnect = in
+		if err := c.Validate(); err != nil {
+			t.Errorf("%q should be accepted, got %v", in, err)
+			continue
+		}
+		if got := c.ResetAndWaitBeforeConnect(); got != want {
+			t.Errorf("%q read as %v, want %v", in, got, want)
+		}
+	}
+	for _, bad := range []string{"yess", "maybe", "1", "on"} {
+		c := validServer()
+		c.Carrier.SendResetAndWaitBeforeConnect = bad
+		if err := c.Validate(); err == nil {
+			t.Errorf("%q should be refused rather than silently read as no", bad)
+		}
+	}
+
+	// It must show in the startup line: a 12s stall per attempt is something you
+	// want to see confirmed, and to notice you left on.
+	c := validServer()
+	c.Carrier.SendResetAndWaitBeforeConnect = "yes"
+	c.Mode = ModeClient
+	c.Carrier.VPSIP = "203.0.113.10"
+	c.Client.Forwards = []Forward{{Proto: "tcp", Listen: "127.0.0.1:14000", TargetPort: 443}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if m := attrMap(t, c.EffectiveAttrs()); m["reset_and_wait_before_connect"] != "true" {
+		t.Errorf("startup line missing the reset setting: %v", m)
+	}
+}
+
 // TestLogLevelValidation: a typo in log_level used to silently mean info, which
 // could leave a server logging client IPs when the operator asked for none.
 func TestLogLevelValidation(t *testing.T) {

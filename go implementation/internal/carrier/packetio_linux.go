@@ -6,6 +6,8 @@ import (
 	"fmt"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/GFW-knocker/gfw_resist_tcp_proxy/internal/firewall"
 )
 
 // linuxIO is a cgo-free packet backend:
@@ -37,6 +39,13 @@ func newPacketIO(p ioParams) (packetIO, error) {
 		unix.Close(sendFD)
 		return nil, fmt.Errorf("carrier: set IP_HDRINCL: %w", err)
 	}
+	// Mark our packets so the firewall's RST-suppression rule can tell gfk's own
+	// deliberate reset (SendReset) from a kernel-generated one and let just
+	// that through — raw sends still traverse mangle/OUTPUT, so without this our
+	// own rule would eat it. Best effort: SO_MARK needs CAP_NET_ADMIN, and the only
+	// casualty of it failing is that one reset packet. The mark is inert on data
+	// packets, which no rule matches.
+	_ = unix.SetsockoptInt(sendFD, unix.SOL_SOCKET, unix.SO_MARK, firewall.Fwmark)
 
 	recvFD, err := unix.Socket(unix.AF_PACKET, unix.SOCK_DGRAM, int(htons16(unix.ETH_P_IP)))
 	if err != nil {

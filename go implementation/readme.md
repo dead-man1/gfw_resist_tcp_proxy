@@ -169,6 +169,25 @@ only ever alternates between 40000 and 40001, while its *destination* port sweep
 45000–45007. Eight ports on the wire, and `client_port_span` is still being
 honoured — it is the destination side you are watching.
 
+**If each reconnect only works on the *next* port** — and restarting both ends
+does not help — that is stale middlebox state, not a blocked port. A conntrack /
+CGNAT entry outlives the session (Linux holds ESTABLISHED for five days) and still
+expects the previous session's sequence window, so `seq_mode: realistic`, which
+opens each session at a fresh random ISN, gets dropped on that tuple forever.
+
+The client handles this by sending a bare TCP RST on a tuple whenever it **lets go
+of** one — session lost, connect attempt failed, or shutdown. Resetting on release
+rather than before use is what makes it free: the middlebox's close timer runs
+while gfk is busy elsewhere, so by the time the port rotation comes back around,
+the entry is gone. No setting, no delay.
+
+For a tuple poisoned by a run that never released it (an older build, a crash, a
+`kill -9`), set `carrier.send_reset_and_wait_before_connect: yes`. That also resets
+and waits **12 s** before every attempt — it has to outlast the middlebox's close
+timer, 10 s on Linux (`nf_conntrack_tcp_timeout_close`), and a shorter wait is
+worse than none, because each retry restarts that timer and the tunnel never
+connects. Turn it on, get connected once, turn it off.
+
 
 ### Restricting destination ports (server)
 

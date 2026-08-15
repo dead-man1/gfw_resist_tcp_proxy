@@ -32,6 +32,36 @@ carrier:
                           # the peer's ack: a fixed peer acks 1 forever, so ~64 KB later every
                           # packet you send is out-of-window and dropped (the ~24s death).
                           # realistic+realistic or fixed+fixed — never one of each.
+  send_reset_and_wait_before_connect: no
+                          # yes|no — default no. Leave it off unless you are recovering a stuck
+                          # port; see below for why it is not needed in normal operation.
+                          #
+                          # BACKGROUND. A middlebox (conntrack, CGNAT) keeps its entry for the
+                          # carrier flow long after a session ends — Linux holds ESTABLISHED for
+                          # FIVE DAYS — and that entry still remembers the old session's sequence
+                          # window. With seq_mode: realistic the next session opens at a fresh
+                          # random ISN, lands nowhere near that window, and every packet is
+                          # dropped. The port then stays dead even if you restart BOTH ends,
+                          # because the stuck state is in the middle, not in either endpoint.
+                          # The symptom is "each reconnect only works on the next port, until the
+                          # span runs out".
+                          #
+                          # NORMALLY HANDLED FOR YOU, with no setting and no delay: the client
+                          # sends a bare RST on a tuple whenever it LETS GO of it — session lost,
+                          # connect attempt failed, or shutdown. That starts the middlebox's close
+                          # timer immediately, so by the time the port rotation comes back around
+                          # the entry is long gone.
+                          #
+                          # THIS OPTION is the recovery path for a tuple poisoned by a run that
+                          # never got to release it (an older build, a crash, kill -9). Set yes
+                          # and gfk also resets and then WAITS 12 SECONDS before every connect
+                          # attempt — long enough to outlast the middlebox's close timer, which is
+                          # 10s on Linux (nf_conntrack_tcp_timeout_close). A shorter wait is worse
+                          # than none: each attempt would restart that timer and the tunnel would
+                          # never connect at all.
+                          # Turn it on, get connected once, then turn it back off — the wait is
+                          # paid on EVERY attempt, including the first.
+                          # Client-only; the server ignores it.
 
 firewall:
   manage: ask             # ask | yes | no

@@ -822,16 +822,17 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 	}
 
 	car, err := carrier.Open(carrier.Options{
-		Role:           carrier.RoleClient,
-		VPSIP:          vpsIP,
-		ServerPort:     cfg.Carrier.ServerPort,
-		ClientPort:     cfg.Carrier.ClientPort,
-		ClientPortSpan: cfg.Carrier.ClientPortSpan,
-		ServerPortSpan: cfg.Carrier.ServerPortSpan,
-		Interface:      cfg.Carrier.Interface,
-		TCPFlags:       cfg.Carrier.TCPFlags,
-		SeqMode:        cfg.Carrier.SeqMode,
-		Warn:           logger.Warn,
+		Role:                      carrier.RoleClient,
+		VPSIP:                     vpsIP,
+		ServerPort:                cfg.Carrier.ServerPort,
+		ClientPort:                cfg.Carrier.ClientPort,
+		ClientPortSpan:            cfg.Carrier.ClientPortSpan,
+		ServerPortSpan:            cfg.Carrier.ServerPortSpan,
+		Interface:                 cfg.Carrier.Interface,
+		TCPFlags:                  cfg.Carrier.TCPFlags,
+		SeqMode:                   cfg.Carrier.SeqMode,
+		Warn:                      logger.Warn,
+		ResetAndWaitBeforeConnect: cfg.ResetAndWaitBeforeConnect(),
 	})
 	if err != nil {
 		cancel()
@@ -858,20 +859,43 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		delay = 3 * time.Second
 	}
 	dialCount := 0
+	sessionWasUp := false
+	// release resets the carrier tuple we are done with, so the middlebox starts
+	// expiring its entry now rather than when we next need the port. Never before
+	// using a tuple: see carrier.SendReset.
+	release := func(why string) {
+		if err := car.SendReset(); err != nil {
+			logger.Debug("could not reset the carrier tuple", "when", why, "err", err)
+		}
+	}
 	sup := supervisor.New(func(dctx context.Context) (transport.Session, error) {
 		if dialCount > 0 {
+			if sessionWasUp {
+				// The previous session died on this tuple. Reset it before rotating
+				// away, while the ports still point at it.
+				release("session lost")
+				sessionWasUp = false
+			}
 			car.RotateClientPort() // fresh source port on reconnect
 			car.RotateServerPort() // rotate server port to escape a blocked one
 		}
 		dialCount++
+		// Opt-in recovery for a tuple poisoned by a run that never released it.
+		// Costs 12s per attempt, hence off by default.
+		if err := car.ResetAndWait(dctx); err != nil {
+			return nil, err
+		}
 		sess, err := transport.Dial(dctx, car, remote, params)
 		if err != nil {
+			release("connect failed") // this port did not come up; free it, then try the next
 			return nil, err
 		}
 		if err := tunnel.Verify(sess, cfg.Auth.Key); err != nil {
 			_ = sess.Close()
+			release("verify failed")
 			return nil, err
 		}
+		sessionWasUp = true
 		logger.Info(string(cfg.Transport)+" tunnel established to server", logx.Peer(remote))
 		return sess, nil
 	}, delay, logger)
@@ -886,6 +910,10 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 
 func (e *engine) stop() {
 	e.cancel()
+	// Hand the carrier tuple back before closing: without it the middlebox holds
+	// its entry for days and the next Connect finds that port dead. Must precede
+	// Close, which takes the injector away.
+	_ = e.car.SendReset()
 	_ = e.car.Close()
 	if e.fwRemove != nil {
 		_ = e.fwRemove()

@@ -21,8 +21,8 @@ import (
 const pcapErrbufSize = 256
 
 var (
-	wpcapOnce      sync.Once
-	wpcapErr       error
+	wpcapOnce        sync.Once
+	wpcapErr         error
 	procOpenLive     *windows.LazyProc
 	procNextEx       *windows.LazyProc
 	procSendPacket   *windows.LazyProc

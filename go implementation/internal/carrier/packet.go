@@ -80,6 +80,11 @@ type TCPFlags struct {
 	PSH bool
 	URG bool
 	FIN bool
+	// RST is NOT reachable from config — ParseTCPFlags refuses it, because a data
+	// segment carrying RST would tear down the flow it belongs to. It exists for
+	// exactly one internal caller, Carrier.SendReset, which sends a standalone
+	// reset to release a carrier tuple gfk is done with.
+	RST bool
 }
 
 // DefaultTCPFlags is what a mid-stream data segment normally carries, and what
@@ -130,7 +135,7 @@ func (f TCPFlags) String() string {
 	for _, b := range []struct {
 		on   bool
 		name string
-	}{{f.ACK, "ack"}, {f.PSH, "psh"}, {f.URG, "urg"}, {f.FIN, "fin"}} {
+	}{{f.ACK, "ack"}, {f.PSH, "psh"}, {f.URG, "urg"}, {f.FIN, "fin"}, {f.RST, "rst"}} {
 		if b.on {
 			set = append(set, b.name)
 		}
@@ -239,8 +244,12 @@ func craftSegment(s segmentSpec) ([]byte, error) {
 		DstIP:    s.dstIP.To4(),
 	}
 	window := s.window
-	if window == 0 {
-		window = maxWindow // fixed mode, and any caller that does not care
+	if window == 0 && !s.flags.RST {
+		// Fixed mode, and any caller that does not care. A reset is excluded on
+		// purpose: a real stack advertises a zero window on an RST (there is no
+		// connection left to receive into), and leaving it at 0 keeps the packet
+		// looking like the kernel's own.
+		window = maxWindow
 	}
 	tcp := &layers.TCP{
 		SrcPort: layers.TCPPort(s.srcPort),
@@ -253,6 +262,7 @@ func craftSegment(s segmentSpec) ([]byte, error) {
 		PSH:    s.flags.PSH && len(s.payload) > 0,
 		URG:    s.flags.URG && len(s.payload) > 0,
 		FIN:    s.flags.FIN,
+		RST:    s.flags.RST,
 		Window: window,
 	}
 	if tcp.URG {

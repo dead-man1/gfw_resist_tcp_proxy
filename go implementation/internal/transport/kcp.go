@@ -32,7 +32,7 @@ func (s *kcpSession) AcceptStream() (Stream, error) {
 }
 
 func (s *kcpSession) RemoteAddr() net.Addr { return s.remote }
-func (s *kcpSession) IsClosed() bool        { return s.sess.IsClosed() }
+func (s *kcpSession) IsClosed() bool       { return s.sess.IsClosed() }
 
 func (s *kcpSession) Close() error {
 	err := s.sess.Close()
