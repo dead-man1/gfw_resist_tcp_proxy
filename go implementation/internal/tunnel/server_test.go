@@ -31,10 +31,10 @@ func TestResolveTargetPortAllowlist(t *testing.T) {
 		AllowSocks5:  true,
 		AllowedPorts: []int{443},
 	}, "psk", log)
-	if _, ok := socks.resolveTarget(connectReq{Cmd: cmdConnectTCP, Atyp: atypIPv4, Host: "1.2.3.4", Port: 80}); ok {
+	if _, ok := socks.resolveTarget(connectReq{Cmd: cmdConnectTCP, Atyp: atypIPv4, Host: "203.0.113.4", Port: 80}); ok {
 		t.Error("SOCKS target on port 80 must be refused by the allowlist")
 	}
-	if _, ok := socks.resolveTarget(connectReq{Cmd: cmdConnectTCP, Atyp: atypIPv4, Host: "1.2.3.4", Port: 443}); !ok {
+	if _, ok := socks.resolveTarget(connectReq{Cmd: cmdConnectTCP, Atyp: atypIPv4, Host: "203.0.113.4", Port: 443}); !ok {
 		t.Error("SOCKS target on port 443 should be allowed")
 	}
 

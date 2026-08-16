@@ -1,0 +1,37 @@
+# Build output. `make` writes into dist/, but a bare `go build` drops the binary
+# next to the package it was run from — which is how gfk-gui.exe keeps appearing
+# beside the Makefile. Paths are anchored so they cannot swallow cmd/gfk/, which
+# is a source directory with the same name as the binary it builds.
+/dist/
+/go implementation/dist/
+/go implementation/gfk
+/go implementation/gfk-gui
+gfk-linux-*
+gfk-windows-*
+*.exe
+
+# Real configs. The *.example.yaml templates are tracked on purpose; a working
+# client.yaml / server.yaml is not. Those carry your server's IP and auth.key —
+# the shared secret is the only true credential in this project, and anyone
+# holding it can use your tunnel.
+client.yaml
+server.yaml
+*.local.yaml
+
+# Field-test output. Captures are the most sensitive thing the project produces:
+# a pcap of a live session contains the real endpoint addresses on both ends.
+*.pcap
+*.pcapng
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

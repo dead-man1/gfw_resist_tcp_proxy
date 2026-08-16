@@ -95,6 +95,6 @@ client:
 # none | error | warn | info | debug
 #   none  = log nothing at all (no addresses can leak)
 #   error = failures only        warn = failures + warnings
-#   info  = normal operation, peer IPs masked to their first two octets (140.170.*.*:443)
+#   info  = normal operation, peer IPs masked to their first two octets (203.0.*.*:443)
 #   debug = everything, peer IPs in full — for troubleshooting, not for pasting in public
 log_level: info

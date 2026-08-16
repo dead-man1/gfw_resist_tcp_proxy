@@ -111,7 +111,7 @@ func Addr(key string, addr any) slog.Attr {
 }
 
 // MaskAddr masks the host part of an "ip:port" (or bare host) string, keeping
-// the port. IPv4 keeps its first two octets ("140.170.*.*:443"), IPv6 its first
+// the port. IPv4 keeps its first two octets ("203.0.*.*:443"), IPv6 its first
 // two groups, and a name that is not an IP is dropped entirely — a hostname can
 // identify a user as precisely as an address.
 func MaskAddr(s string) string {

@@ -66,6 +66,6 @@ server:
 # none | error | warn | info | debug
 #   none  = log nothing at all: no client IP is ever written to the log
 #   error = failures only        warn = failures + warnings
-#   info  = normal operation, client IPs masked to their first two octets (140.170.*.*:443)
+#   info  = normal operation, client IPs masked to their first two octets (203.0.*.*:443)
 #   debug = everything, client IPs in full — troubleshooting only; this log identifies your users
 log_level: info
