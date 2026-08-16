@@ -853,7 +853,6 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		KCP:              cfg.KCP,
 		QUIC:             cfg.QUIC,
 	}
-	remote := &carrier.Addr{IP: vpsIP, Port: cfg.Carrier.ServerPort}
 	delay := time.Duration(cfg.Client.ReconnectSeconds) * time.Second
 	if delay <= 0 {
 		delay = 3 * time.Second
@@ -885,6 +884,10 @@ func startEngine(cfg config.Config, applyFW bool, onState func(supervisor.State)
 		if err := car.ResetAndWait(dctx); err != nil {
 			return nil, err
 		}
+		// Read after rotation: this is the port actually being dialled, not the base
+		// from the config. It must also be what ReadFrom reports, or the transport
+		// discards every reply as coming from the wrong source.
+		remote := car.RemoteAddr()
 		sess, err := transport.Dial(dctx, car, remote, params)
 		if err != nil {
 			release("connect failed") // this port did not come up; free it, then try the next

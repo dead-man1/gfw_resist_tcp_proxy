@@ -248,7 +248,7 @@ func TestDataSegmentsNeverCarryRST(t *testing.T) {
 	for _, mode := range []SeqMode{SeqFixed, SeqRealistic} {
 		f := newFakeIO()
 		c := newTestClient(f, mode)
-		if _, err := c.WriteTo([]byte("payload"), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte("payload"), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		h := parseHeader(t, <-f.sent)

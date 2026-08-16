@@ -179,7 +179,6 @@ func main() {
 }
 
 func runClient(ctx context.Context, cfg config.Config, car *carrier.Carrier, params transport.Params, logger *slog.Logger) {
-	remote := &carrier.Addr{IP: net.ParseIP(cfg.Carrier.VPSIP), Port: cfg.Carrier.ServerPort}
 	delay := time.Duration(cfg.Client.ReconnectSeconds) * time.Second
 	if delay <= 0 {
 		delay = 3 * time.Second
@@ -215,6 +214,10 @@ func runClient(ctx context.Context, cfg config.Config, car *carrier.Carrier, par
 		if err := car.ResetAndWait(dctx); err != nil {
 			return nil, err
 		}
+		// Read after rotation: this is the port actually being dialled, not the base
+		// from the config. It must also be what ReadFrom reports, or the transport
+		// discards every reply as coming from the wrong source.
+		remote := car.RemoteAddr()
 		sess, err := transport.Dial(dctx, car, remote, params)
 		if err != nil {
 			release("connect failed") // this port did not come up; free it, then try the next

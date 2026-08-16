@@ -60,6 +60,12 @@ func newPacketIO(p ioParams) (packetIO, error) {
 		unix.Close(recvFD)
 		return nil, fmt.Errorf("carrier: bind packet socket to %s: %w", iface.Name, err)
 	}
+	// A receive timeout so Capture returns even on a silent link. Without it the
+	// loop parks in recvfrom until the next packet, and Close would have to pull the
+	// fd out from under it — the loop must be able to notice it should stop. Best
+	// effort: a kernel that refuses this just means Close falls back to its timeout.
+	_ = unix.SetsockoptTimeval(recvFD, unix.SOL_SOCKET, unix.SO_RCVTIMEO,
+		&unix.Timeval{Sec: 0, Usec: 250_000})
 
 	return &linuxIO{
 		sendFD: sendFD,
@@ -84,6 +90,8 @@ func (l *linuxIO) Capture() ([]byte, error) {
 			if err == unix.EINTR {
 				continue
 			}
+			// EAGAIN is the receive timeout above: hand it back so the receive loop
+			// gets a chance to see that the carrier is closing.
 			return nil, err
 		}
 		// Ignore packets we ourselves transmitted on this interface.

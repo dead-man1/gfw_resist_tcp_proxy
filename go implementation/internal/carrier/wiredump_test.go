@@ -15,7 +15,7 @@ func TestDumpRealisticStream(t *testing.T) {
 
 	// send reports the header the way a capture would show it, options included.
 	send := func(payload, note string) tcpHeader {
-		if _, err := c.WriteTo([]byte(payload), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte(payload), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		pkt := <-f.sent
@@ -103,7 +103,7 @@ func TestDumpFixedStream(t *testing.T) {
 	defer c.Close()
 
 	for _, p := range []string{"hello", "more data here"} {
-		if _, err := c.WriteTo([]byte(p), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte(p), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		pkt := <-f.sent

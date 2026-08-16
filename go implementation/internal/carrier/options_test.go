@@ -48,7 +48,7 @@ func TestFixedModeHeaderUnchanged(t *testing.T) {
 	defer c.Close()
 
 	for i := 0; i < 5; i++ {
-		if _, err := c.WriteTo([]byte("payload"), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte("payload"), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		pkt := <-f.sent
@@ -79,7 +79,7 @@ func TestRealisticModeAddsTimestamps(t *testing.T) {
 	defer c.Close()
 
 	send := func() []byte {
-		if _, err := c.WriteTo([]byte("payload"), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte("payload"), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		return <-f.sent
@@ -147,7 +147,7 @@ func TestRealisticModeEchoesPeerTimestamp(t *testing.T) {
 		}
 	}
 	sendEcr := func() uint32 {
-		if _, err := c.WriteTo([]byte("x"), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte("x"), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		_, ecr := timestampsOf(t, <-f.sent)
@@ -177,13 +177,13 @@ func TestPeerWithoutTimestampsIsTolerated(t *testing.T) {
 	c := newTestClient(f, SeqRealistic)
 	defer c.Close()
 
-	if _, err := c.WriteTo([]byte("x"), c.peer); err != nil {
+	if _, err := c.WriteTo([]byte("x"), c.RemoteAddr()); err != nil {
 		t.Fatal(err)
 	}
 	_, guessed := timestampsOf(t, <-f.sent)
 
 	feedFromServer(t, c, f, 500000, "no options here") // testSegment sends none
-	if _, err := c.WriteTo([]byte("y"), c.peer); err != nil {
+	if _, err := c.WriteTo([]byte("y"), c.RemoteAddr()); err != nil {
 		t.Fatal(err)
 	}
 	val, ecr := timestampsOf(t, <-f.sent)
@@ -206,7 +206,7 @@ func TestRealisticWindowVaries(t *testing.T) {
 	seen := map[uint16]int{}
 	const n = 300
 	for i := 0; i < n; i++ {
-		if _, err := c.WriteTo([]byte("payload"), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte("payload"), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		w := tcpWindow(t, <-f.sent)
@@ -242,7 +242,7 @@ func TestRealisticPacketSizeOnTheWire(t *testing.T) {
 		c := newTestClient(f, mode)
 		defer c.Close()
 		payload := make([]byte, mtu-TCPOptionBytes(mode))
-		if _, err := c.WriteTo(payload, c.peer); err != nil {
+		if _, err := c.WriteTo(payload, c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		return len(<-f.sent)

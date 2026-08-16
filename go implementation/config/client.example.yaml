@@ -90,16 +90,27 @@ kcp:
 
 client:
   # SOCKS5 proxy for any app (requires server allow_socks5: true). Empty disables.
+  # Same listen rule as the forwards below: 127.0.0.1 = this PC only, 0.0.0.0 = the LAN too.
   socks5_listen: "127.0.0.1:1080"
-  # Port-forwards: each entry is an INDEPENDENT local listener -> server backend_ip:target_port.
-  # Add as many as you want — they ALL run at the same time over the single tunnel (one
-  # multiplexed session). Each `listen` port must be unique; each entry may target a different
-  # port. Example below: three local ports, each mapped to a different server-side service.
+
+  # PORT-FORWARDS. Each entry is one local listener wired to one port on the VPS:
+  #
+  #     listen: "<local_ip>:<local_port>"   ->   target_port: <xray_inbound_port_on_vps>
+  #
+  # traffic that send to <local_ip>:<local_port> on THIS MACHINE comes to server.backend_ip:<target_port> 
+  # (backend_ip is set in server.yaml and is 127.0.0.1 by default). 
+  # The VPS port does NOT have to be open to the internet — the traffic arrives from inside the tunnel.
+  #
+  #   listen: "127.0.0.1:14000"   only programs on this PC can connect
+  #   listen: "0.0.0.0:14000"     any device on your LAN (phones, TVs, other PCs)
+  #
+  # Below: connect to 127.0.0.1:14000 on this PC and you reach port 2096 on the VPS.
   forwards:
     - {proto: tcp, listen: "127.0.0.1:14000", target_port: 2096}
     - {proto: tcp, listen: "127.0.0.1:15000", target_port: 443}
     - {proto: tcp, listen: "127.0.0.1:16000", target_port: 2083}
     - {proto: udp, listen: "127.0.0.1:17000", target_port: 945}
+  # - {proto: tcp, listen: "0.0.0.0:14000",  target_port: 2096}   # same, but LAN-reachable
   keepalive_seconds: 4    # heartbeat; keeps the NAT pinhole open. Dead-peer detect ~= 2x this
   reconnect_seconds: 2    # delay between reconnect attempts
 

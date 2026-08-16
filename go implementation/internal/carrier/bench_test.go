@@ -85,6 +85,7 @@ func BenchmarkRecvLoopReject(b *testing.B) {
 		tcpFlags: DefaultTCPFlags(),
 		rx:       make(chan rxPacket, 1024),
 		closed:   make(chan struct{}),
+		rxDone:   make(chan struct{}),
 	}
 	c.curServerPort.Store(uint32(c.opts.ServerPort))
 	b.SetBytes(int64(len(pkt)))
@@ -107,6 +108,7 @@ func BenchmarkRecvLoopAccept(b *testing.B) {
 		tcpFlags: DefaultTCPFlags(),
 		rx:       make(chan rxPacket, 1024),
 		closed:   make(chan struct{}),
+		rxDone:   make(chan struct{}),
 	}
 	c.curServerPort.Store(uint32(c.opts.ServerPort))
 	buf := make([]byte, 2048)

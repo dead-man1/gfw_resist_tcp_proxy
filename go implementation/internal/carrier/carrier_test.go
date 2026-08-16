@@ -2,17 +2,28 @@ package carrier
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
 
 // fakeIO is an in-memory packetIO: Capture yields queued inbound packets,
 // Inject records outbound ones. Capture unblocks when Close is called.
+//
+// It also stands in for the real backends' one unforgiving rule: injecting after
+// the backend is closed is a use-after-free in native code (pcap_close on
+// Windows), which kills the process rather than returning an error. Here that
+// shows up as injectedAfterClose instead of a crash.
 type fakeIO struct {
 	inbound chan []byte
 	sent    chan []byte
 	stop    chan struct{}
+
+	closed             atomic.Bool
+	closes             atomic.Int32
+	injectedAfterClose atomic.Bool
 }
 
 func newFakeIO() *fakeIO {
@@ -23,9 +34,30 @@ func newFakeIO() *fakeIO {
 	}
 }
 
+// drain consumes sent packets so Inject never blocks. For tests that hammer the
+// send path rather than inspecting individual packets.
+func (f *fakeIO) drain() {
+	go func() {
+		for {
+			select {
+			case <-f.sent:
+			case <-f.stop:
+				return
+			}
+		}
+	}()
+}
+
 func (f *fakeIO) Inject(p []byte) error {
+	if f.closed.Load() {
+		f.injectedAfterClose.Store(true)
+		return nil
+	}
 	cp := append([]byte(nil), p...)
-	f.sent <- cp
+	select {
+	case f.sent <- cp:
+	case <-f.stop:
+	}
 	return nil
 }
 
@@ -35,11 +67,24 @@ func (f *fakeIO) Capture() ([]byte, error) {
 		return b, nil
 	case <-f.stop:
 		return nil, net.ErrClosed
+	case <-time.After(20 * time.Millisecond):
+		// Both real backends return periodically whether or not a packet arrived —
+		// Npcap has a read timeout, the Linux socket an SO_RCVTIMEO — which is what
+		// lets the receive loop notice a closing carrier. A fake that blocked forever
+		// would hide that and make Close fall back to its timeout.
+		return nil, errFakeCaptureTimeout
 	}
 }
 
+// errFakeCaptureTimeout stands in for a backend read timeout: nothing captured,
+// try again. The receive loop treats any error as transient and re-checks whether
+// the carrier is closing.
+var errFakeCaptureTimeout = errors.New("fake capture timeout")
+
 func (f *fakeIO) Close() error {
-	close(f.stop)
+	f.closes.Add(1)
+	f.closed.Store(true)
+	close(f.stop) // panics if called twice — that is the point, Close must be once
 	return nil
 }
 
@@ -65,6 +110,7 @@ func newTestServer(vpsIP net.IP, pio packetIO) *Carrier {
 		pio:    pio,
 		rx:     make(chan rxPacket, 16),
 		closed: make(chan struct{}),
+		rxDone: make(chan struct{}),
 	}
 	go c.recvLoop()
 	return c
@@ -184,6 +230,7 @@ func TestServerPortSpan(t *testing.T) {
 		pio:    f,
 		rx:     make(chan rxPacket, 16),
 		closed: make(chan struct{}),
+		rxDone: make(chan struct{}),
 	}
 	c.curServerPort.Store(uint32(c.opts.ServerPort))
 	go c.recvLoop()

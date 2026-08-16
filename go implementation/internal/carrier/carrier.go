@@ -77,7 +77,13 @@ type Carrier struct {
 	opts    Options
 	pio     packetIO
 	localIP net.IP
-	peer    *Addr // client mode: the single server peer
+	// peer is the client's view of the server: VPSIP plus the server port CURRENTLY
+	// targeted, which RotateServerPort moves. It is what ReadFrom reports as the
+	// source of every inbound packet, and kcp-go drops any packet whose source does
+	// not match the remote address it was dialled with — so this must track the
+	// rotation, and callers must dial the address RemoteAddr reports. Atomic because
+	// the receive loop reads it while the reconnect loop rotates.
+	peer atomic.Pointer[Addr]
 
 	// curClientPort is the client's current carrier source port, rotated across
 	// [ClientPort, ClientPort+ClientPortSpan) on reconnect to dodge a KCP session
@@ -110,9 +116,15 @@ type Carrier struct {
 	bytesIn  atomic.Uint64
 	bytesOut atomic.Uint64
 
-	rx        chan rxPacket
-	closed    chan struct{}
+	rx     chan rxPacket
+	closed chan struct{}
+	// rxDone is closed by recvLoop when it returns, so Close knows the receive
+	// loop is no longer inside the packet backend. See Close.
+	rxDone    chan struct{}
 	closeOnce sync.Once
+	// ioMu serialises packet injection and keeps Close from tearing the backend
+	// down underneath one. See inject.
+	ioMu sync.Mutex
 
 	rdMu         sync.Mutex
 	readDeadline time.Time
@@ -386,11 +398,12 @@ func Open(opts Options) (*Carrier, error) {
 		warn:     opts.Warn,
 		rx:       make(chan rxPacket, 1024),
 		closed:   make(chan struct{}),
+		rxDone:   make(chan struct{}),
 	}
 	c.curClientPort.Store(uint32(opts.ClientPort))
 	c.curServerPort.Store(uint32(opts.ServerPort))
 	if opts.Role == RoleClient {
-		c.peer = &Addr{IP: opts.VPSIP, Port: opts.ServerPort}
+		c.peer.Store(&Addr{IP: opts.VPSIP, Port: opts.ServerPort})
 		c.clientSeq = newSeqState()
 	}
 	go c.recvLoop()
@@ -427,9 +440,20 @@ func (c *Carrier) RotateServerPort() uint16 {
 	base := uint32(c.opts.ServerPort)
 	next := base + (c.curServerPort.Load()-base+1)%uint32(c.opts.ServerPortSpan)
 	c.curServerPort.Store(next)
+	// Keep the reported peer in step. ReadFrom hands this address to the transport
+	// as the source of every inbound packet, and kcp-go silently drops packets whose
+	// source differs from the address it was dialled with — so a stale peer here
+	// would mean a tunnel that never connects on any rotated port.
+	c.peer.Store(&Addr{IP: c.opts.VPSIP, Port: uint16(next)})
 	c.resetSeq()
 	return uint16(next)
 }
+
+// RemoteAddr is the server address the client is currently talking to: VPSIP plus
+// the rotated server port, not the base one from the config. Dial with this — it
+// is also what ReadFrom reports, and the transport requires the two to agree.
+// Nil on the server, which has many peers rather than one.
+func (c *Carrier) RemoteAddr() *Addr { return c.peer.Load() }
 
 // resetWait is how long ResetAndWait blocks after its reset.
 //
@@ -483,7 +507,7 @@ func (c *Carrier) SendReset() error {
 	if err != nil {
 		return err
 	}
-	if err := c.pio.Inject(pkt); err != nil {
+	if err := c.inject(pkt); err != nil {
 		return err
 	}
 	// Deliberately not counted in bytesOut: this is path maintenance, not tunnel
@@ -564,7 +588,18 @@ func firstGlobalUnicastIPv4() (net.IP, error) {
 }
 
 func (c *Carrier) recvLoop() {
+	// Tell Close the loop has left the packet backend for good. Close waits for
+	// this before tearing the backend down: on Windows, Capture sits inside
+	// pcap_next_ex, and freeing the handle underneath it faults in wpcap.dll.
+	defer close(c.rxDone)
 	for {
+		// Checked before every Capture, so a closed carrier stops entering the
+		// backend even if the last call returned normally.
+		select {
+		case <-c.closed:
+			return
+		default:
+		}
 		raw, err := c.pio.Capture()
 		if err != nil {
 			select {
@@ -585,7 +620,7 @@ func (c *Carrier) recvLoop() {
 			if !seg.srcIP.Equal(c.opts.VPSIP) || seg.srcPort != uint16(c.curServerPort.Load()) || seg.dstPort != uint16(c.curClientPort.Load()) {
 				continue
 			}
-			addr = c.peer
+			addr = c.peer.Load()
 		} else {
 			// Accept any dst port in the server span; the client rotates within it.
 			span := c.opts.ServerPortSpan
@@ -714,7 +749,7 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	if err := c.pio.Inject(ipPkt); err != nil {
+	if err := c.inject(ipPkt); err != nil {
 		return 0, err
 	}
 	c.bytesOut.Add(uint64(len(p)))
@@ -762,12 +797,66 @@ func (c *Carrier) SetWriteDeadline(time.Time) error {
 	}
 }
 
+// inject is the single path to the packet backend. It exists to serialise two
+// things that must never overlap:
+//
+//   - Two injections at once. The Windows backend serialises into one shared
+//     buffer, so concurrent callers would interleave and put garbage on the wire.
+//     There are genuinely concurrent callers: the transport writes from its own
+//     goroutines while the reconnect loop can send a reset.
+//   - An injection and Close. Close tears the backend down — on Windows that is
+//     pcap_close — and a send already inside the library then touches freed native
+//     state. That does not panic, it takes the process down, which is what a
+//     Disconnect during a reconnect attempt was doing.
+//
+// After Close, injection is refused rather than attempted.
+func (c *Carrier) inject(pkt []byte) error {
+	c.ioMu.Lock()
+	defer c.ioMu.Unlock()
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+	return c.pio.Inject(pkt)
+}
+
+// rxDrainTimeout bounds how long Close waits for the receive loop to come out of
+// the packet backend. Both backends return from a capture promptly — Npcap has a
+// 10 ms read timeout, the Linux socket a receive timeout — so the wait is normally
+// microseconds. The bound only stops a wedged backend from hanging shutdown.
+const rxDrainTimeout = time.Second
+
 // Close implements net.PacketConn.
+//
+// Order matters here, and getting it wrong is fatal rather than untidy. The
+// backend must not be torn down while another goroutine is inside it:
+//
+//   - the receive loop blocks in pcap_next_ex (Windows) / recvfrom (Linux), and
+//     freeing the pcap handle underneath it faults inside wpcap.dll — an
+//     0xc0000005 that kills the process with no Go panic;
+//   - an injection may be in flight for the same reason.
+//
+// So: signal, wait for the reader to leave, exclude injectors, and only then
+// close.
 func (c *Carrier) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
-		close(c.closed)
+		close(c.closed) // stop new injections and new captures
+
+		// Wait for recvLoop to return. rxDone is nil only for a Carrier built
+		// without Open (tests that never start the loop).
+		if c.rxDone != nil {
+			select {
+			case <-c.rxDone:
+			case <-time.After(rxDrainTimeout):
+			}
+		}
+
+		// And for an injection already in progress; see inject.
+		c.ioMu.Lock()
 		err = c.pio.Close()
+		c.ioMu.Unlock()
 	})
 	return err
 }

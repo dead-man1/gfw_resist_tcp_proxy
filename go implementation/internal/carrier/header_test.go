@@ -137,10 +137,11 @@ func newTestClient(f *fakeIO, mode SeqMode) *Carrier {
 		seqMode:  mode,
 		rx:       make(chan rxPacket, 16),
 		closed:   make(chan struct{}),
+		rxDone:   make(chan struct{}),
 	}
 	c.curClientPort.Store(uint32(c.opts.ClientPort))
 	c.curServerPort.Store(uint32(c.opts.ServerPort))
-	c.peer = &Addr{IP: c.opts.VPSIP, Port: c.opts.ServerPort}
+	c.peer.Store(&Addr{IP: c.opts.VPSIP, Port: c.opts.ServerPort})
 	if mode == SeqRealistic {
 		c.clientSeq = newSeqState()
 	}
@@ -157,7 +158,7 @@ func TestRealisticSeqAdvancesAndAcks(t *testing.T) {
 	defer c.Close()
 
 	send := func(payload string) tcpHeader {
-		if _, err := c.WriteTo([]byte(payload), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte(payload), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		return parseHeader(t, <-f.sent)
@@ -265,7 +266,7 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 	f := newFakeIO()
 	c := newTestClient(f, SeqFixed)
 	defer c.Close()
-	if _, err := c.WriteTo([]byte("x"), c.peer); err != nil {
+	if _, err := c.WriteTo([]byte("x"), c.RemoteAddr()); err != nil {
 		t.Fatal(err)
 	}
 	if h := parseHeader(t, <-f.sent); h.seq != carrierSeq || h.ack != carrierAck {
@@ -372,7 +373,7 @@ func TestSeqRollsOverOnTheWire(t *testing.T) {
 
 	var seqs []uint32
 	for i := 0; i < 4; i++ {
-		if _, err := c.WriteTo(payload, c.peer); err != nil {
+		if _, err := c.WriteTo(payload, c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		seqs = append(seqs, parseHeader(t, <-f.sent).seq)
@@ -421,7 +422,7 @@ func TestFixedSeqMode(t *testing.T) {
 	defer c.Close()
 
 	for _, payload := range []string{"aaaa", "bbbbbbbbbbbbbbbb"} {
-		if _, err := c.WriteTo([]byte(payload), c.peer); err != nil {
+		if _, err := c.WriteTo([]byte(payload), c.RemoteAddr()); err != nil {
 			t.Fatal(err)
 		}
 		h := parseHeader(t, <-f.sent)
@@ -442,6 +443,7 @@ func TestServerPerClientSeqState(t *testing.T) {
 		seqMode:  SeqRealistic,
 		rx:       make(chan rxPacket, 16),
 		closed:   make(chan struct{}),
+		rxDone:   make(chan struct{}),
 	}
 	c.curServerPort.Store(uint32(c.opts.ServerPort))
 	go c.recvLoop()
