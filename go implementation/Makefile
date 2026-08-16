@@ -22,7 +22,13 @@ VER_PATCH := $(or $(word 3,$(subst ., ,$(VERNUM))),0)
 
 # Pinned, because an unpinned @latest would let the resource block change shape
 # between two builds of the same tag.
-GOVERSIONINFO := go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.5.0
+#
+# Overridable (?=) because `go run pkg@version` always reaches the network, even
+# with the module already cached, and the proxy is not reliably reachable from
+# everywhere this project gets built. Two ways out:
+#   make gui GOVERSIONINFO=goversioninfo   # after a one-off `go install`
+#   GOPROXY=file://$(go env GOMODCACHE)/cache/download make gui
+GOVERSIONINFO ?= go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.5.0
 
 # _windows_amd64 is a Go build constraint expressed in the filename: the linker
 # picks this up only for that target, so it cannot leak into the Linux CLI.

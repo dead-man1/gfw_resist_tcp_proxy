@@ -1,6 +1,19 @@
 module github.com/GFW-knocker/gfw_resist_tcp_proxy
 
+// The language version, i.e. the OLDEST Go that can build this module. Kept
+// deliberately behind the toolchain below so a contributor on 1.25 is not shut
+// out; raise it only to use a 1.26 language feature.
 go 1.25.0
+
+// The toolchain that actually builds it, pinned to an exact patch and matched by
+// go-version in .github/workflows/release.yml.
+//
+// Not a formality: a release built with go1.25.12 on GitHub's runner was flagged
+// Trojan:Win32/Wacatac.B!ml, while the same commit built locally on go1.25.2 was
+// clean, and pinning is what makes "same commit, same binary" true. A bare minor
+// like "1.26" floats to whatever patch is newest on build day, which is how the
+// two ends drifted apart in the first place.
+toolchain go1.26.6
 
 require (
 	fyne.io/fyne/v2 v2.8.0
