@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Application manifest for the Windows GUI build.
+
+  A Go binary linked by mingw carries no resources at all unless one is supplied:
+  no version block, no manifest, no icon. That is worth fixing on its own — an
+  unnamed 30 MB executable is what users see in Task Manager and in the UAC and
+  SmartScreen prompts — and it also removes one of the traits that pushes an
+  unsigned binary toward a machine-learning malware verdict. See the release
+  workflow, which generates the .syso from this file and versioninfo.json.
+
+  requestedExecutionLevel is asInvoker ON PURPOSE. gfk needs Administrator for
+  raw sockets, Npcap and firewall rules, but it asks for none of that here: the
+  app checks isElevated() at startup and warns (cmd/gfk-gui/main.go). Switching
+  this to requireAdministrator would make Windows put a UAC prompt in front of
+  every launch, including the ones where the user only wants to read the log or
+  edit a config. That is a product decision, not a packaging one — do not change
+  it here without changing the startup check to match.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="io.github.GFW-knocker.gfk-tunnel"
+      version="1.0.0.0"
+      processorArchitecture="amd64"/>
+
+  <description>gfk tunnel - fake-TCP carrier tunnel client</description>
+
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!--
+    Declaring the supported Windows versions stops the OS applying its
+    compatibility shims for pre-Windows-10 software. No dpiAware element: Fyne
+    negotiates DPI through GLFW itself, and declaring it here as well would
+    change how the window scales.
+  -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+</assembly>

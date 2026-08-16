@@ -1,5 +1,5 @@
-# Build gfk for Linux, macOS and Windows (many arches) + the Windows GUI, then
-# publish everything to a GitHub Release.
+# Build gfk for Linux, macOS and Windows (many arches) + the Windows GUI, scan
+# everything, then publish it all to a GitHub Release.
 #
 # Run it manually: Actions tab -> "Release" -> "Run workflow" -> enter the tag
 # and title. (workflow_dispatch prompts for them before it starts.)
@@ -9,13 +9,18 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.1.0) — created if it doesn't exist"
+        description: "Release tag (e.g. v0.1.0) - created if it doesn't exist"
         required: true
         type: string
       title:
         description: "Release title"
         required: true
         type: string
+      skip_malware_gate:
+        description: "Publish even if Defender flags a binary (for a known false positive)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write # needed to create the release and its tag
@@ -65,24 +70,157 @@ jobs:
         with:
           go-version: "1.25"
           cache-dependency-path: "go implementation/go.sum"
-      - name: C toolchain (mingw is preinstalled on windows runners)
-        run: gcc --version
+
+      # The runner's bundled mingw is whatever the image happens to ship, and it
+      # moves without notice: a v2.0 GUI built here came out with binutils ld
+      # 2.46 and no .rsrc section at all, while the same commit and the same Go
+      # version built against MSYS2's gcc produced an 11-section binary that
+      # Defender was happy with. Pinning the C toolchain to one we choose makes
+      # the output ours rather than the image's. MSYS2 is still a rolling
+      # distribution, so this controls the toolchain without freezing it - the
+      # scan job below is what catches a bad roll.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: inherit # so setup-go's `go` stays visible inside the shell
+          install: >-
+            mingw-w64-x86_64-gcc
+
+      - name: Record C toolchain
+        shell: msys2 {0}
+        run: |
+          gcc --version | head -1
+          ld --version | head -1
+
+      # Without this the released GUI carries no resources whatsoever: no
+      # version block, no company, no manifest. Windows then has nothing to show
+      # in the file's Details tab or in a UAC/SmartScreen prompt, and an unsigned
+      # unnamed binary scores worse with every reputation heuristic that looks.
+      - name: Windows resource metadata (version info + manifest)
+        shell: pwsh
+        working-directory: "go implementation"
+        run: |
+          $tag = "${{ inputs.tag }}"
+          # FixedFileInfo is four integers; a tag like v2.0 or v2.0.1-rc1 has to
+          # be reduced to them, with missing components defaulting to 0.
+          $num = ($tag -replace '^[vV]', '') -replace '[^0-9.].*$', ''
+          $p = @(($num -split '\.' | Where-Object { $_ -ne '' }) + @('0','0','0'))
+          $icon = if (Test-Path cmd/gfk-gui/icon.ico) { @('-icon', 'cmd/gfk-gui/icon.ico') } else { @() }
+          go run github.com/josephspurrier/goversioninfo/cmd/goversioninfo@v1.5.0 `
+            -64 -manifest cmd/gfk-gui/gfk-gui.manifest $icon `
+            -ver-major $p[0] -ver-minor $p[1] -ver-patch $p[2] -ver-build 0 `
+            -product-ver-major $p[0] -product-ver-minor $p[1] -product-ver-patch $p[2] -product-ver-build 0 `
+            -file-version "$tag" -product-version "$tag" `
+            -o cmd/gfk-gui/resource_windows_amd64.syso cmd/gfk-gui/versioninfo.json
+          if (-not (Test-Path cmd/gfk-gui/resource_windows_amd64.syso)) {
+            throw "goversioninfo produced no .syso - the GUI would ship without version info"
+          }
+
       - name: Build GUI
+        shell: msys2 {0}
         working-directory: "go implementation"
         env:
           CGO_ENABLED: "1"
         # -H windowsgui: no console window (the GUI has its own log pane).
+        # Paths stay relative so MSYS2 does not rewrite them on the way to Go.
         run: go build -tags gui -trimpath -ldflags "-s -w -H windowsgui" -o dist/gfk-windows-GUI.exe ./cmd/gfk-gui
+
+      - name: Confirm the resource block landed
+        shell: pwsh
+        working-directory: "go implementation"
+        run: |
+          $v = (Get-Item dist/gfk-windows-GUI.exe).VersionInfo
+          if (-not $v.ProductName) { throw "no version resource in the built GUI" }
+          "ProductName    : $($v.ProductName)"
+          "FileVersion    : $($v.FileVersion)"
+          "CompanyName    : $($v.CompanyName)"
+          "FileDescription: $($v.FileDescription)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: gfk-windows-GUI.exe
           path: "go implementation/dist/gfk-windows-GUI.exe"
           if-no-files-found: error
 
+  # --- Smoke-test every artifact against Defender before anyone downloads it ---
+  #
+  # This is a canary, not a guarantee: it is one engine, with the runner's
+  # signature set, on the day of the build. A clean result here does not promise
+  # a clean result on a user's machine three weeks later. What it does buy is
+  # finding out BEFORE publishing rather than from a bug report afterwards.
+  #
+  # Anything it flags is a false positive until proven otherwise - report it at
+  # https://www.microsoft.com/en-us/wdsi/filesubmission (as "Software developer")
+  # and re-run with skip_malware_gate to publish in the meantime.
+  scan:
+    name: Malware scan (Defender)
+    needs: [build-cli, build-gui]
+    runs-on: windows-latest
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Update Defender signatures
+        shell: pwsh
+        continue-on-error: true # a stale signature set still beats no scan
+        run: |
+          $plat = Get-ChildItem "C:\ProgramData\Microsoft\Windows Defender\Platform" -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          $mp = if ($plat) { Join-Path $plat.FullName "MpCmdRun.exe" } else { "C:\Program Files\Windows Defender\MpCmdRun.exe" }
+          if (Test-Path $mp) { & $mp -SignatureUpdate }
+
+      - name: Scan release binaries
+        shell: pwsh
+        env:
+          SKIP_GATE: ${{ inputs.skip_malware_gate }}
+        run: |
+          $plat = Get-ChildItem "C:\ProgramData\Microsoft\Windows Defender\Platform" -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          $mp = if ($plat) { Join-Path $plat.FullName "MpCmdRun.exe" } else { "C:\Program Files\Windows Defender\MpCmdRun.exe" }
+          if (-not (Test-Path $mp)) {
+            Write-Warning "MpCmdRun.exe not found on this runner - skipping the scan gate."
+            exit 0
+          }
+
+          $flagged = @()
+          foreach ($f in Get-ChildItem dist -File -Recurse | Sort-Object Name) {
+            # -DisableRemediation so a detection does not delete the artifact out
+            # from under the rest of the job.
+            $out = & $mp -Scan -ScanType 3 -File $f.FullName -DisableRemediation 2>&1 | Out-String
+            $m = [regex]::Match($out, 'Threat\s+:\s+(\S+)')
+            if ($m.Success) {
+              $flagged += [pscustomobject]@{ File = $f.Name; Threat = $m.Groups[1].Value }
+              "FLAGGED  $($f.Name)  ->  $($m.Groups[1].Value)"
+            } elseif ($out -match 'found no threats') {
+              "clean    $($f.Name)"
+            } else {
+              "unknown  $($f.Name)  (scanner returned no verdict)"
+            }
+          }
+
+          $summary = if ($flagged) {
+            "## Defender scan`n`n| File | Verdict |`n| --- | --- |`n" +
+            (($flagged | ForEach-Object { "| $($_.File) | ``$($_.Threat)`` |" }) -join "`n")
+          } else { "## Defender scan`n`nAll artifacts clean." }
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+          if ($flagged) {
+            if ($env:SKIP_GATE -eq 'true') {
+              Write-Warning "$($flagged.Count) artifact(s) flagged; publishing anyway because skip_malware_gate is set."
+              exit 0
+            }
+            Write-Error "$($flagged.Count) artifact(s) flagged by Defender. Almost certainly a false positive - report it at https://www.microsoft.com/en-us/wdsi/filesubmission and re-run with skip_malware_gate: true to publish regardless."
+            exit 1
+          }
+
   # --- Collect all artifacts and publish the release ---
   release:
     name: Publish release
-    needs: [build-cli, build-gui]
+    needs: [build-cli, build-gui, scan]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 # for the config templates
@@ -97,6 +235,11 @@ jobs:
           cp "go implementation/config/client.example.yaml" dist/client.yaml
       - name: List
         run: ls -lh dist
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:

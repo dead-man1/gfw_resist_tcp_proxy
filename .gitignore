@@ -10,6 +10,13 @@ gfk-linux-*
 gfk-windows-*
 *.exe
 
+# Generated Windows resource block (icon, version info, manifest). Built from
+# cmd/gfk-gui/versioninfo.json + gfk-gui.manifest by `make syso`, which the gui
+# target runs for you, and by the release workflow. It is a compiled COFF object
+# carrying the version number, so committing it would mean a binary file that
+# has to be regenerated on every version bump.
+*.syso
+
 # Real configs. The *.example.yaml templates are tracked on purpose; a working
 # client.yaml / server.yaml is not. Those carry your server's IP and auth.key —
 # the shared secret is the only true credential in this project, and anyone
