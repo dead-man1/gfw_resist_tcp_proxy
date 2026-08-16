@@ -87,7 +87,7 @@ func TestPacketShapeValidation(t *testing.T) {
 		}
 	}
 
-	for _, mode := range []string{"", "fixed", "realistic"} {
+	for _, mode := range []string{"", "fixed", "random", "realistic", "REALISTIC", " random "} {
 		c := validServer()
 		c.Carrier.SeqMode = mode
 		if err := c.Validate(); err != nil {
@@ -95,9 +95,52 @@ func TestPacketShapeValidation(t *testing.T) {
 		}
 	}
 	c := validServer()
-	c.Carrier.SeqMode = "random"
+	c.Carrier.SeqMode = "plausible"
 	if err := c.Validate(); err == nil {
-		t.Error("seq_mode random should be refused")
+		t.Error("an unknown seq_mode should be refused")
+	}
+}
+
+// TestSendWindowClampedOnlyWhenSeqAdvances pins the fix for the field failure
+// where seq_mode: realistic died within seconds: KCP was free to keep ~180 KB in
+// flight, a middlebox dropped everything past 64 KB, and because those drops also
+// stopped the ack that reopens the window, the flow never recovered. Only the
+// mode whose seq advances is subject to that ceiling, so only it may be clamped —
+// slowing the other two down would be a pure loss.
+func TestSendWindowClampedOnlyWhenSeqAdvances(t *testing.T) {
+	for _, mode := range []string{"fixed", "random", ""} {
+		c := validServer()
+		c.Carrier.SeqMode = mode
+		got, clamped := c.EffectiveKCP()
+		if clamped || got.SndWnd != c.KCP.SndWnd {
+			t.Errorf("seq_mode %q: sndwnd changed to %d (clamped=%v); no window ceiling applies when seq stands still",
+				mode, got.SndWnd, clamped)
+		}
+	}
+
+	c := validServer()
+	c.Carrier.SeqMode = "realistic"
+	c.KCP.SndWnd = 128
+	got, clamped := c.EffectiveKCP()
+	if !clamped {
+		t.Fatalf("seq_mode realistic with sndwnd 128 must be clamped")
+	}
+	if inFlight := got.SndWnd * c.TransportMTU(); inFlight > 65535 {
+		t.Errorf("clamped window still allows %d bytes in flight, over the 65535 ceiling", inFlight)
+	}
+	if got.SndWnd < 1 {
+		t.Errorf("clamped to %d packets, which would stall the transport", got.SndWnd)
+	}
+	// Everything else must survive the clamp untouched.
+	if got.RcvWnd != c.KCP.RcvWnd || got.NoDelay != c.KCP.NoDelay || got.FECData != c.KCP.FECData {
+		t.Errorf("clamping altered unrelated kcp settings: %+v", got)
+	}
+
+	// A window already inside the ceiling is left exactly as configured — the
+	// clamp is a ceiling, not a target.
+	c.KCP.SndWnd = 8
+	if got, clamped := c.EffectiveKCP(); clamped || got.SndWnd != 8 {
+		t.Errorf("sndwnd 8 = %d (clamped=%v), want it left alone", got.SndWnd, clamped)
 	}
 }
 

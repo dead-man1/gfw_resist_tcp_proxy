@@ -114,11 +114,31 @@ func TestParseSeqMode(t *testing.T) {
 			t.Errorf("ParseSeqMode(%q) = %v, %v; want fixed", in, got, err)
 		}
 	}
-	if got, err := ParseSeqMode("realistic"); err != nil || got != SeqRealistic {
-		t.Errorf("ParseSeqMode(realistic) = %v, %v", got, err)
+	for in, want := range map[string]SeqMode{
+		"realistic": SeqRealistic, "REALISTIC": SeqRealistic,
+		"random": SeqRandom, " Random ": SeqRandom,
+	} {
+		if got, err := ParseSeqMode(in); err != nil || got != want {
+			t.Errorf("ParseSeqMode(%q) = %v, %v; want %v", in, got, err, want)
+		}
 	}
-	if _, err := ParseSeqMode("random"); err == nil {
+	if _, err := ParseSeqMode("plausible"); err == nil {
 		t.Error("ParseSeqMode should reject an unknown mode")
+	}
+
+	// The two predicates the rest of the carrier branches on. Advances is what
+	// subjects a mode to the middlebox window ceiling; Camouflaged is what gives
+	// it a seqState at all — and both must say "no" for the zero value, which is
+	// the empty string rather than SeqFixed.
+	for mode, want := range map[SeqMode][2]bool{
+		SeqFixed:     {false, false},
+		SeqRandom:    {false, true},
+		SeqRealistic: {true, true},
+		SeqMode(""):  {false, false},
+	} {
+		if got := [2]bool{mode.Advances(), mode.Camouflaged()}; got != want {
+			t.Errorf("%q: {Advances, Camouflaged} = %v, want %v", mode, got, want)
+		}
 	}
 }
 
@@ -142,8 +162,8 @@ func newTestClient(f *fakeIO, mode SeqMode) *Carrier {
 	c.curClientPort.Store(uint32(c.opts.ClientPort))
 	c.curServerPort.Store(uint32(c.opts.ServerPort))
 	c.peer.Store(&Addr{IP: c.opts.VPSIP, Port: c.opts.ServerPort})
-	if mode == SeqRealistic {
-		c.clientSeq = newSeqState()
+	if mode.Camouflaged() {
+		c.clientSeq = newSeqState(mode)
 	}
 	go c.recvLoop()
 	return c
@@ -217,7 +237,7 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 	// position, or the ack would freeze and the flow would look stuck. Both
 	// directions of that comparison are exercised here.
 	for _, peerSeq := range []uint32{5, 1 << 30, 0xFFFFFF00} {
-		s := newSeqState()
+		s := newSeqState(SeqRealistic)
 		guess := s.ack
 		if guess == carrierAck {
 			t.Fatal("a fresh flow should not ack 1")
@@ -230,7 +250,7 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 
 	// Forward motion only: a reordered/retransmitted earlier segment must not
 	// pull the ack back.
-	s := newSeqState()
+	s := newSeqState(SeqRealistic)
 	s.observe(100000, 100, 0, false) // ack -> 100100
 	s.observe(90000, 100, 0, false)  // an older segment arriving late
 	if _, ack, _ := s.next(1); ack != 100100 {
@@ -246,7 +266,7 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 	// rejected the wrapped value, our ack would freeze at ~2^32 — which is exactly
 	// the frozen-ack condition that gets a flow window-dropped, arriving silently
 	// after 4.29 GB.
-	s = newSeqState()
+	s = newSeqState(SeqRealistic)
 	s.observe(0xFFFFFFE0, 16, 0, false) // ack -> 0xFFFFFFF0
 	s.observe(0xFFFFFFF0, 32, 0, false) // peer's stream rolls over: ack -> 0x00000010
 	if _, ack, _ := s.next(1); ack != 0x00000010 {
@@ -255,7 +275,7 @@ func TestAckIsRealisticFromTheFirstPacket(t *testing.T) {
 
 	// Serial arithmetic: when the peer starts a whole new flow (its own ISN), the
 	// large step reads as forward motion and must be adopted, not ignored.
-	s = newSeqState()
+	s = newSeqState(SeqRealistic)
 	s.observe(0xFFFFFF00, 16, 0, false) // ack -> 0xFFFFFF10
 	s.observe(0x20000000, 8, 0, false)  // peer restarted at a fresh ISN
 	if _, ack, _ := s.next(1); ack != 0x20000008 {
@@ -318,7 +338,7 @@ func TestRandomISNCoversTheFullRange(t *testing.T) {
 // back to the ISN here, which reads as a multi-gigabyte forward leap and gets the
 // flow dropped as out-of-window.
 func TestSeqWrapsLikeRealTCP(t *testing.T) {
-	s := newSeqState()
+	s := newSeqState(SeqRealistic)
 	s.seq = 0xFFFFFFF0 // 16 bytes of sequence space left before the rollover
 
 	first, _, _ := s.next(10)  // 0xFFFFFFF0, leaves 0xFFFFFFFA
@@ -396,7 +416,7 @@ func TestSeqRollsOverOnTheWire(t *testing.T) {
 // TestSeqSurvivesAFullLap walks the counter all the way around 2^32 and checks it
 // lands where TCP says it should, with no discontinuity anywhere.
 func TestSeqSurvivesAFullLap(t *testing.T) {
-	s := newSeqState()
+	s := newSeqState(SeqRealistic)
 	start, _, _ := s.next(0)
 
 	const step = 1 << 20 // 1 MiB at a time: 4096 laps steps == exactly 2^32

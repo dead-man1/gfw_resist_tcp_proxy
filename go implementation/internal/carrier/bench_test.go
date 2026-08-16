@@ -145,7 +145,7 @@ func BenchmarkCraftSegmentRealistic(b *testing.B) {
 	src, dst := net.IPv4(192, 168, 1, 5), net.IPv4(203, 0, 113, 10)
 	payload := make([]byte, 1400-tsOptionLen)
 	flags := DefaultTCPFlags()
-	s := newSeqState()
+	s := newSeqState(SeqRealistic)
 	b.SetBytes(int64(len(payload)))
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
@@ -168,7 +168,7 @@ func BenchmarkCraftSegmentRealistic(b *testing.B) {
 // BenchmarkSeqStateNext is the extra bookkeeping seq_mode: realistic adds per
 // sent packet (sequence arithmetic plus the timestamp clock read).
 func BenchmarkSeqStateNext(b *testing.B) {
-	s := newSeqState()
+	s := newSeqState(SeqRealistic)
 	for i := 0; i < b.N; i++ {
 		s.next(1400)
 	}

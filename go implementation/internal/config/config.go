@@ -97,28 +97,16 @@ type CarrierConfig struct {
 	// down on every middlebox in the path. Set per side; the peer does not care
 	// which bits arrive.
 	TCPFlags []string `yaml:"tcp_flags"`
-	// SeqMode selects the TCP sequence numbers of crafted segments:
-	//   fixed     — seq = ack = 1 on every packet (default). Safest for
-	//               window-tracking NAT, but obvious to anyone reading a capture.
-	//   realistic — BOTH numbers behave like a real established connection: a
-	//               random ISN with seq advancing by the payload length, and an
-	//               ack that starts from a plausible random position and then
-	//               tracks the peer's stream forward-only. Past 4.29 GB both roll
-	//               over modulo 2^32 and carry on, exactly as TCP does.
-	//
-	// MUST MATCH on both ends. gfk never reads the peer's numbers, but a stateful
-	// NAT validates a climbing seq against the peer's ack — and a fixed-mode peer
-	// acks 1 forever, so a realistic/fixed pairing dies one ~64 KB window in.
+	// SeqMode is fixed|random|realistic (default fixed) — what the TCP sequence
+	// numbers of crafted segments do. See carrier.SeqMode for the detail; in
+	// short, fixed and random hold seq still and run at full speed, realistic
+	// advances it and is therefore capped (and clamped — see EffectiveKCP) at one
+	// unscaled 64 KB window per RTT. MUST MATCH on both ends.
 	SeqMode string `yaml:"seq_mode"`
-	// SendResetAndWaitBeforeConnect ("yes" or "no", default "no") additionally sends
-	// a reset and waits 12s before EVERY connect attempt.
-	//
-	// The client always resets a tuple when it lets go of it — session lost, connect
-	// attempt failed, or shutdown — which keeps tuples clean at no cost, because the
-	// middlebox's close timer runs while gfk is busy elsewhere. This option is the
-	// recovery path for a tuple poisoned by something that never released it (an
-	// older build, a crash, a kill -9). It is off by default because the 12s wait is
-	// paid on every attempt: turn it on, get connected, turn it off.
+	// SendResetAndWaitBeforeConnect is yes|no (default no): also reset and wait 12s
+	// before EVERY connect attempt. Recovery only — for a tuple left poisoned by a
+	// run that never released it (older build, crash, kill -9). Normal operation
+	// needs nothing, because the client already resets each tuple as it lets go.
 	SendResetAndWaitBeforeConnect string `yaml:"send_reset_and_wait_before_connect"`
 }
 
@@ -266,6 +254,42 @@ func (c Config) TransportMTU() int {
 	return c.Carrier.MTU - carrier.TCPOptionBytes(mode)
 }
 
+// EffectiveKCP returns the KCP settings actually used, and whether the send
+// window had to be reduced from the configured value.
+//
+// seq_mode: realistic advances the carrier's sequence number as it sends, which
+// puts it under a middlebox's window ceiling: it drops anything more than one
+// unscaled window (65535 bytes, since no SYN means no window scale) past the
+// peer's last ack. The default sndwnd of 128 packets is ~180 KB in flight, nearly
+// three times that — and overrunning the ceiling does not throttle the link, it
+// kills it, because the dropped packets are precisely the ones that would have
+// advanced the ack that reopens the window. Clamping the window turns a permanent
+// stall into a plain rate cap of roughly 64 KB/RTT.
+//
+// The other two modes hold seq still, so no ceiling applies and nothing is
+// clamped. Each side clamps its own send window, which is the one it controls.
+func (c Config) EffectiveKCP() (KCPConfig, bool) {
+	k := c.KCP
+	mode, err := carrier.ParseSeqMode(c.Carrier.SeqMode)
+	if err != nil {
+		return k, false // unvalidated config; Validate reports the real error
+	}
+	limit := carrier.InFlightLimit(mode)
+	perPacket := c.TransportMTU()
+	if limit <= 0 || perPacket <= 0 {
+		return k, false
+	}
+	maxWnd := limit / perPacket
+	if maxWnd < 1 {
+		maxWnd = 1
+	}
+	if k.SndWnd <= maxWnd {
+		return k, false
+	}
+	k.SndWnd = maxWnd
+	return k, true
+}
+
 // EffectiveAttrs returns the settings that actually took effect, as slog
 // key/value pairs, for a single "this is what I am running with" line at
 // startup. It covers every knob the Windows GUI has no widget for (interface,
@@ -311,16 +335,24 @@ func (c Config) EffectiveAttrs() []any {
 	}
 	switch c.Transport {
 	case TransportKCP:
+		// The effective window, not the configured one: realistic mode clamps it,
+		// and a line titled "settings in effect" that printed the unclamped value
+		// would send anyone debugging throughput off in the wrong direction.
+		kcp, clamped := c.EffectiveKCP()
+		sndwnd := any(kcp.SndWnd)
+		if clamped {
+			sndwnd = fmt.Sprintf("%d (clamped from %d by seq_mode: realistic)", kcp.SndWnd, c.KCP.SndWnd)
+		}
 		a = append(a,
-			"kcp_nodelay", c.KCP.NoDelay,
-			"kcp_interval", c.KCP.Interval,
-			"kcp_resend", c.KCP.Resend,
-			"kcp_nc", c.KCP.NC,
-			"kcp_sndwnd", c.KCP.SndWnd,
-			"kcp_rcvwnd", c.KCP.RcvWnd,
-			"kcp_fec", fmt.Sprintf("%d/%d", c.KCP.FECData, c.KCP.FECParity),
-			"kcp_stream_buffer", c.KCP.StreamBuffer,
-			"kcp_session_buffer", c.KCP.SessionBuffer,
+			"kcp_nodelay", kcp.NoDelay,
+			"kcp_interval", kcp.Interval,
+			"kcp_resend", kcp.Resend,
+			"kcp_nc", kcp.NC,
+			"kcp_sndwnd", sndwnd,
+			"kcp_rcvwnd", kcp.RcvWnd,
+			"kcp_fec", fmt.Sprintf("%d/%d", kcp.FECData, kcp.FECParity),
+			"kcp_stream_buffer", kcp.StreamBuffer,
+			"kcp_session_buffer", kcp.SessionBuffer,
 		)
 	case TransportQUIC:
 		a = append(a,

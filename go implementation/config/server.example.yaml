@@ -17,22 +17,19 @@ carrier:
                           # syn and rst are REFUSED: a SYN is the one packet the GFW matches
                           # against its IP blocklist, and a RST tears the flow down everywhere.
                           # Need NOT match the client (each side only crafts its own packets).
-  seq_mode: fixed         # fixed | realistic — TCP sequence numbers on carrier packets.
-                          #   fixed:     seq = ack = 1 always. Safest with window-tracking NAT.
-                          #   realistic: the whole header looks like an established connection,
-                          #              tracked per client: random ISN with seq growing by the
-                          #              payload length; an ack that tracks that client
-                          #              forward-only; a window jittering near 65535; and RFC 7323
-                          #              timestamps (NOP,NOP,TS) as a real stack sends mid-stream.
-                          #              Past 4.29 GB the sequence rolls over modulo 2^32 and the
-                          #              stream carries on, exactly as TCP does. Costs 12 header
-                          #              bytes, taken off the payload so the IP packet stays
-                          #              exactly mtu+40 either way.
-                          # MUST MATCH THE CLIENT. Not because gfk reads the peer's numbers (it
-                          # doesn't) but because a stateful NAT checks a climbing seq against the
-                          # peer's ack: a fixed peer acks 1 forever, so ~64 KB later that
-                          # direction is out-of-window and dropped (the ~24s death).
-                          # realistic+realistic or fixed+fixed — never one of each.
+  seq_mode: fixed         # fixed | random | realistic — what TCP seq/ack do on carrier packets.
+                          #   fixed     — seq = ack = 1 forever. Full speed; a capture makes the
+                          #               tunnel obvious.
+                          #   random    — random ISN plus the peer's real ack position, both then
+                          #               held CONSTANT, with a jittered window and RFC 7323
+                          #               timestamps. Reads as an ordinary mid-stream segment and
+                          #               is still full speed. RECOMMENDED.
+                          #   realistic — seq genuinely advances, so the flow reassembles into a
+                          #               real TCP stream. Most convincing, but with no SYN there
+                          #               is no window scale, so a NAT caps it near 64 KB/RTT
+                          #               (~400 kB/s) and gfk clamps kcp sndwnd to fit.
+                          # MUST MATCH THE PEER. random and realistic cost 12 header bytes, taken
+                          # off the payload so the IP packet stays mtu+40 in every mode.
 
 firewall:
   manage: ask             # ask | yes | no  (use "yes" under systemd)
@@ -45,7 +42,9 @@ kcp:
   interval: 10            # internal update/flush period, ms (10 = responsive, 20-40 = lower CPU)
   resend: 2               # fast-retransmit after this many duplicate ACKs; 0 = disabled
   nc: 1                   # 1 = no congestion control (KCP's normal mode); 0 = CC on (usually WORSE here)
-  sndwnd: 128             # send window, packets — the MAIN speed/latency knob
+  sndwnd: 128             # send window, packets — the MAIN speed/latency knob.
+                          # Automatically clamped in seq_mode: realistic (see above); the other
+                          # modes use it as written.
   rcvwnd: 128             # receive window, packets. Set near BDP: pkts ≈ bandwidth_bps × RTT_s / 8 / mtu.
                           # too small = caps speed; too large = bufferbloat (high jitter). See profiles.
   fec_data: 0             # Reed-Solomon FEC data shards; 0 = FEC off (saves bandwidth)

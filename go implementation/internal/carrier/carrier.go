@@ -37,14 +37,14 @@ type Options struct {
 	// config carrier.tcp_flags (ack|psh|urg|fin). Empty = ack+psh. Open parses
 	// and rejects syn/rst.
 	TCPFlags []string
-	// SeqMode is config carrier.seq_mode: "fixed" (seq/ack pinned to 1) or
-	// "realistic". Empty = fixed.
+	// SeqMode is config carrier.seq_mode: "fixed", "random" or "realistic"
+	// (empty = fixed). See the SeqMode constants for what each does.
 	//
-	// gfk itself never inspects the peer's numbers, but "realistic" still has to
-	// MATCH on both ends: a climbing seq only stays inside a stateful NAT's window
-	// because the peer's ack keeps advancing to cover it. Point realistic at a
-	// fixed peer and that direction dies once it is a window past the peer's
-	// frozen ack. Open wires Warn to catch it at runtime.
+	// gfk never inspects the peer's numbers, but the choice still has to MATCH on
+	// both ends, because a stateful NAT reads both sides of the flow: a climbing
+	// seq only stays inside its window because the peer's ack keeps advancing to
+	// cover it. Point realistic at a peer whose seq stands still and that
+	// direction dies one window later. Open wires Warn to catch it at runtime.
 	SeqMode string
 	// Warn, if set, reports a non-fatal runtime problem (currently: a peer whose
 	// seq_mode disagrees with ours). Signature matches slog.Logger.Warn so a
@@ -104,17 +104,25 @@ type Carrier struct {
 	seqMode  SeqMode
 	warn     func(msg string, args ...any) // optional; see Options.Warn
 	// clientSeq is the single sequence state of the client role; peerSeq holds one
-	// *seqState per client for the server role (addr string -> *seqState). Only
-	// used when seqMode is SeqRealistic.
+	// *seqState per client for the server role (addr string -> *seqState). Unused
+	// when seqMode is SeqFixed.
 	clientSeq *seqState
 	peerSeq   sync.Map
-	// fixedPeerHits counts consecutive inbound packets that carry the fixed-mode
-	// constant seq; warnedPeerFixed makes the resulting warning fire once.
-	fixedPeerHits   atomic.Uint32
-	warnedPeerFixed atomic.Bool
+	// Peer seq_mode detection: lastPeerSeq/peerSeqSeen track whether the peer's
+	// sequence number ever moves, staticPeerHits counts how long it has not, and
+	// warnedPeerStatic makes the resulting warning fire once. See checkPeerSeqMode.
+	lastPeerSeq      atomic.Uint32
+	peerSeqSeen      atomic.Bool
+	staticPeerHits   atomic.Uint32
+	warnedPeerStatic atomic.Bool
 
 	bytesIn  atomic.Uint64
 	bytesOut atomic.Uint64
+	// Wedge detection, client role: lastRxNanos is when the last carrier packet
+	// arrived on the current tuple (0 = none yet) and outAtLastRx is bytesOut at
+	// that instant. Reset on port rotation, since that is a new tuple. See Wedged.
+	lastRxNanos atomic.Int64
+	outAtLastRx atomic.Uint64
 
 	rx     chan rxPacket
 	closed chan struct{}
@@ -130,10 +138,16 @@ type Carrier struct {
 	readDeadline time.Time
 }
 
-// seqState is the fake-TCP sequence bookkeeping for one flow in
-// seq_mode: realistic. It makes a capture of the carrier look like an
-// established connection: a random ISN, seq advancing by exactly the bytes
-// sent, and an ack that tracks what the peer sent.
+// seqState is the fake-TCP sequence bookkeeping for one flow in the two
+// camouflaged seq modes. Both draw a random ISN, a real ack position, a jittered
+// window and RFC 7323 timestamps; they differ in one bit, advance:
+//
+//	random    — advance=false. seq and ack are drawn once and then held. Every
+//	            packet reads as a plausible mid-stream segment, but the flow as a
+//	            whole is one segment repeated, so no window ceiling can apply.
+//	realistic — advance=true. seq grows by the bytes sent and the ack follows the
+//	            peer, so the flow reassembles into a real stream. This is what
+//	            subjects it to the middlebox window ceiling (see inFlightBudget).
 //
 // Wrapping at 2^32 needs no special case, and must not have one. Sequence
 // numbers are modulo-2^32 by design (RFC 793): a real connection that transfers
@@ -148,6 +162,10 @@ type Carrier struct {
 // 2 GB, which every window-tracking middlebox reads as wildly out of window and
 // drops until the tunnel gives up and reconnects. Do not reintroduce it.
 type seqState struct {
+	// advance selects realistic (true) over random (false); see the type comment.
+	// Written only by newSeqState, so it needs no locking.
+	advance bool
+
 	mu  sync.Mutex
 	seq uint32 // sequence number for the next byte we send; wraps at 2^32
 	ack uint32 // what we ack: the peer's last seq + its payload length
@@ -167,8 +185,8 @@ type seqState struct {
 	tsSeen  bool
 }
 
-func newSeqState() *seqState {
-	s := &seqState{}
+func newSeqState(mode SeqMode) *seqState {
+	s := &seqState{advance: mode.Advances()}
 	s.reset()
 	return s
 }
@@ -204,7 +222,14 @@ func (s *seqState) next(n uint32) (seq, ack uint32, ts tcpTimestamps) {
 	seq, ack = s.seq, s.ack
 	// Modulo 2^32, exactly as TCP defines it: past 4.29 GB this rolls over and the
 	// stream continues uninterrupted. No special case — see the type comment.
-	s.seq += n
+	//
+	// Random mode skips this entirely. Holding seq still is what keeps the flow
+	// out of reach of a middlebox's window arithmetic, and it costs nothing in
+	// realism per packet: a stack retransmitting a segment sends this same header
+	// with a fresh timestamp, which is exactly what comes out below.
+	if s.advance {
+		s.seq += n
+	}
 	// A 1 ms clock, wrapping naturally like a real one. Monotonic within the flow
 	// because tsStart only moves on reset, which redraws tsBase at the same time.
 	// Read under the lock: reset writes tsStart/tsBase together and we must not see
@@ -221,18 +246,22 @@ func (s *seqState) next(n uint32) (seq, ack uint32, ts tcpTimestamps) {
 //
 // The first inbound packet replaces the guess from reset outright — it must, or a
 // guess that happens to sit "after" the peer's real position would freeze the ack
-// there, which is the frozen-ack situation that gets a flow window-dropped.
-// After that the ack only advances: a real cumulative ack never regresses, so a
-// reordered or retransmitted packet must not walk it backwards. The comparison is
-// serial-number arithmetic (RFC 1982), so it stays correct across a 2^32 wrap and
-// treats the peer's own overflow restart as forward motion.
+// there, which is the frozen-ack situation that gets a flow window-dropped. That
+// adoption matters in BOTH modes: until it happens we are acking a random number
+// that no middlebox can reconcile with anything the peer has sent.
+//
+// After that the modes part. Realistic keeps the ack moving forward with the
+// peer, never backwards, using serial-number arithmetic (RFC 1982) so it stays
+// correct across a 2^32 wrap. Random holds the adopted value: its peer's seq is
+// standing still too, so an ack that never moves stays consistent with the stream
+// a middlebox thinks it is watching.
 func (s *seqState) observe(peerSeq uint32, payloadLen int, peerTS uint32, hasTS bool) {
 	ack := peerSeq + uint32(payloadLen)
 	if ack == 0 {
 		ack = 1 // ack 0 does not occur in an established stream
 	}
 	s.mu.Lock()
-	if !s.seen || int32(ack-s.ack) > 0 {
+	if !s.seen || (s.advance && int32(ack-s.ack) > 0) {
 		s.ack, s.seen = ack, true
 	}
 	// TSecr echoes the peer's clock, under the same rules as the ack: adopt the
@@ -264,32 +293,41 @@ func randomISN() uint32 {
 	return 1
 }
 
-// checkPeerSeqMode warns once if the peer is evidently running seq_mode: fixed
-// while we run realistic — the one combination that is worse than either mode on
-// its own.
+// staticPeerHits is how many consecutive payload-carrying packets must repeat the
+// same seq before we call the peer non-advancing. A realistic peer cannot repeat
+// one at all — its seq moves with every byte it sends, retransmissions included —
+// so this only needs to be above the noise floor.
+const staticPeerHits = 3
+
+// checkPeerSeqMode warns once when the peer's seq_mode disagrees with ours in the
+// direction that breaks: we advance and it does not.
 //
-// Why it matters: a stateful NAT (Linux conntrack and friends) validates our
-// climbing seq against the peer's last ack plus the peer's advertised window. A
-// fixed-mode peer acks 1 forever, so that ceiling never moves; roughly one window
-// of traffic later — 64 KB, which is ~24 s on a slow link — every packet we send
-// is out-of-window and gets dropped. That is the exact failure this project hit
-// before fixed mode existed. Realistic mode escapes it only because a realistic
-// peer's ack advances to cover what we sent, so both ends must agree.
+// A stateful NAT validates our climbing seq against the peer's last ack plus the
+// peer's advertised window. A peer whose own seq stands still — seq_mode fixed or
+// random — settles its ack once and holds it there, so that ceiling never moves.
+// A little over 64 KB later every packet we send is out of window and dropped,
+// and because the drops are what stop our ack from advancing, it never recovers.
+// It is the same deadlock as outrunning the window unaided, reached even at a
+// trickle. Realistic mode escapes it only because a realistic peer's ack keeps
+// rising to cover what we sent, so both ends must agree.
+//
+// The reverse pairing needs no warning: if we stand still and the peer advances,
+// the peer is the one that will notice.
 func (c *Carrier) checkPeerSeqMode(peerSeq uint32) {
-	if c.warn == nil || c.warnedPeerFixed.Load() {
+	if c.warn == nil || !c.seqMode.Advances() || c.warnedPeerStatic.Load() {
 		return
 	}
-	if peerSeq != carrierSeq {
-		c.fixedPeerHits.Store(0)
+	// Detect "has not moved" rather than "equals 1", so this covers a random-mode
+	// peer (whose constant is a random ISN) as well as a fixed-mode one.
+	prev := c.lastPeerSeq.Swap(peerSeq)
+	if !c.peerSeqSeen.Swap(true) || prev != peerSeq {
+		c.staticPeerHits.Store(0)
 		return
 	}
-	// Three inbound packets all sitting at seq==1 is a fixed-mode peer, not a
-	// coincidence: a realistic peer draws a random ISN and advances it with every
-	// payload byte, so it cannot stay there.
-	if c.fixedPeerHits.Add(1) >= 3 && c.warnedPeerFixed.CompareAndSwap(false, true) {
-		c.warn("peer looks like seq_mode: fixed while this side is realistic — " +
-			"set seq_mode the same on both ends, or a stateful NAT will drop this direction " +
-			"about one 64 KB window from now")
+	if c.staticPeerHits.Add(1) >= staticPeerHits && c.warnedPeerStatic.CompareAndSwap(false, true) {
+		c.warn("peer's sequence numbers are not advancing (its seq_mode looks like fixed or " +
+			"random) while this side is realistic — set seq_mode the same on both ends, or a " +
+			"stateful NAT will drop this direction about one 64 KB window from now")
 	}
 }
 
@@ -305,7 +343,7 @@ func (c *Carrier) seqFor(addr *Addr) *seqState {
 	if v, ok := c.peerSeq.Load(key); ok {
 		return v.(*seqState)
 	}
-	actual, _ := c.peerSeq.LoadOrStore(key, newSeqState())
+	actual, _ := c.peerSeq.LoadOrStore(key, newSeqState(c.seqMode))
 	return actual.(*seqState)
 }
 
@@ -404,7 +442,7 @@ func Open(opts Options) (*Carrier, error) {
 	c.curServerPort.Store(uint32(opts.ServerPort))
 	if opts.Role == RoleClient {
 		c.peer.Store(&Addr{IP: opts.VPSIP, Port: opts.ServerPort})
-		c.clientSeq = newSeqState()
+		c.clientSeq = newSeqState(seqMode)
 	}
 	go c.recvLoop()
 	return c, nil
@@ -425,7 +463,7 @@ func (c *Carrier) RotateClientPort() uint16 {
 	base := uint32(c.opts.ClientPort)
 	next := base + (c.curClientPort.Load()-base+1)%uint32(c.opts.ClientPortSpan)
 	c.curClientPort.Store(next)
-	c.resetSeq()
+	c.resetTuple()
 	return uint16(next)
 }
 
@@ -445,7 +483,7 @@ func (c *Carrier) RotateServerPort() uint16 {
 	// source differs from the address it was dialled with — so a stale peer here
 	// would mean a tunnel that never connects on any rotated port.
 	c.peer.Store(&Addr{IP: c.opts.VPSIP, Port: uint16(next)})
-	c.resetSeq()
+	c.resetTuple()
 	return uint16(next)
 }
 
@@ -481,7 +519,9 @@ const resetWait = 12 * time.Second
 // middle, not in either endpoint. Resetting as we let go of the tuple starts the
 // middlebox's close timer immediately, so by the time the port rotation comes back
 // around to it, it is long gone. Resetting just before reuse would instead force us
-// to sit out that timer (see resetWait).
+// to sit out that timer (see resetWait). Both camouflaged seq modes draw a fresh
+// ISN per tuple, so both need this; fixed mode reopens at the same seq every time
+// and would survive without it.
 //
 // The packet is what a kernel emits to reject an unknown connection: RST alone, no
 // ACK flag, seq and ack at 1, zero window, no options, no payload. Sent in both seq
@@ -541,13 +581,61 @@ func (c *Carrier) ResetAndWait(ctx context.Context) error {
 	return nil
 }
 
-// resetSeq starts a fresh sequence flow on the client after a port rotation: the
-// new 4-tuple is a new connection to every middlebox on the path, and a real
-// connection would open with a new ISN. No-op in fixed mode.
-func (c *Carrier) resetSeq() {
-	if c.seqMode == SeqRealistic && c.clientSeq != nil {
+// resetTuple starts fresh after a client port rotation. The new 4-tuple is a new
+// connection to every middlebox on the path, so the sequence flow reopens with a
+// new ISN (as a real connection would) and the wedge detector forgets what the
+// old tuple was doing — it judges the tuple in use, not the client as a whole.
+func (c *Carrier) resetTuple() {
+	if c.seqMode.Camouflaged() && c.clientSeq != nil {
 		c.clientSeq.reset()
 	}
+	c.lastRxNanos.Store(0)
+	c.outAtLastRx.Store(0)
+}
+
+// Wedge detection thresholds. The failure being caught is a middlebox that has
+// started discarding one direction of the carrier tuple: we keep transmitting,
+// the peer keeps replying, and nothing arrives — for as long as the transport
+// takes to give up (~16 s with the default smux keepalive), all of it wasted on a
+// tuple that will never recover.
+//
+// Both conditions are required. Silence alone would fire on an idle tunnel; bytes
+// alone would fire during a normal burst. Together they mean "we are actively
+// pushing data into a hole", which no working link does.
+const (
+	wedgeSilence  = 3 * time.Second
+	wedgeMinBytes = 32 << 10
+)
+
+// Wedged reports whether the current carrier tuple has stopped delivering inbound
+// traffic, returning a human-readable reason or "" if it looks healthy. The
+// supervisor polls it so a dead tuple is abandoned in ~3 s instead of ~16 s;
+// rotating to the next port is the only cure, since the stuck state is in a
+// middlebox rather than in either endpoint.
+//
+// Client role only. The server has many tuples and no way to rotate them, and a
+// client that has simply gone away must not look like a fault.
+func (c *Carrier) Wedged() string {
+	if c.opts.Role != RoleClient {
+		return ""
+	}
+	last := c.lastRxNanos.Load()
+	if last == 0 {
+		// Nothing has ever arrived on this tuple, so there is no working state to
+		// have lost. A tuple that never comes up at all is the dial timeout's job.
+		return ""
+	}
+	silence := time.Since(time.Unix(0, last))
+	if silence < wedgeSilence {
+		return ""
+	}
+	sent := c.bytesOut.Load() - c.outAtLastRx.Load()
+	if sent < wedgeMinBytes {
+		return ""
+	}
+	return fmt.Sprintf("nothing received on the carrier tuple for %s while sending %d KB — "+
+		"a middlebox is dropping this direction; rotating ports",
+		silence.Round(100*time.Millisecond), sent>>10)
 }
 
 // usableSrcIP reports whether ip is a sane reply source address.
@@ -646,9 +734,18 @@ func (c *Carrier) recvLoop() {
 
 		// Mirror the peer's sequence number into our ack, so the numbers we craft
 		// stay consistent with the stream a middlebox is watching.
-		if c.seqMode == SeqRealistic {
+		if c.seqMode.Camouflaged() {
 			c.seqFor(addr).observe(seg.seq, len(seg.payload), seg.tsVal, seg.hasTS)
 			c.checkPeerSeqMode(seg.seq)
+		}
+
+		// The tuple is delivering. Record when, and how much we had sent by then,
+		// so Wedged can tell "quiet" from "being dropped". Order matters: bytesOut
+		// is read first so the snapshot can only lag, never overstate what was sent
+		// during the silence that follows.
+		if c.opts.Role == RoleClient {
+			c.outAtLastRx.Store(c.bytesOut.Load())
+			c.lastRxNanos.Store(time.Now().UnixNano())
 		}
 
 		payload := make([]byte, len(seg.payload))
@@ -729,8 +826,9 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 	}
 
 	// Fixed mode emits exactly the header it always has: constant seq/ack, a full
-	// window, no options. Realistic mode adds the sequence bookkeeping, a jittered
-	// window and the timestamp option.
+	// window, no options. The camouflaged modes add the sequence bookkeeping, a
+	// jittered window and the timestamp option; whether seq then moves is
+	// seqState's business, not ours.
 	spec := segmentSpec{
 		srcIP: srcIP, dstIP: dstIP,
 		srcPort: srcPort, dstPort: dstPort,
@@ -739,7 +837,7 @@ func (c *Carrier) WriteTo(p []byte, addr net.Addr) (int, error) {
 		window:  maxWindow,
 		payload: p,
 	}
-	if c.seqMode == SeqRealistic {
+	if c.seqMode.Camouflaged() {
 		seq, ack, ts := c.seqFor(peer).next(uint32(len(p)))
 		spec.seq, spec.ack = seq, ack
 		spec.window = randomWindow()

@@ -40,34 +40,60 @@ func feedFromServer(t *testing.T, c *Carrier, f *fakeIO, seq uint32, payload str
 	}
 }
 
-// TestWarnsOnSeqModeMismatch: running realistic against a fixed-mode peer is the
-// one combination that reproduces the ~24s NAT death (our seq climbs past a
-// ceiling the peer's frozen ack never raises). It must be reported, not silently
-// endured.
+// TestWarnsOnSeqModeMismatch: running realistic against a peer whose seq stands
+// still reproduces the NAT death (our seq climbs past a ceiling the peer's
+// settled ack never raises). It must be reported, not silently endured.
+//
+// The peer's constant is a parameter because the detector must catch BOTH
+// non-advancing modes: fixed sits at seq 1, random sits at its own random ISN.
+// Nothing may key on the value.
 func TestWarnsOnSeqModeMismatch(t *testing.T) {
+	for _, peerSeq := range []uint32{carrierSeq, 0x9E3779B9} {
+		w := &warnRecorder{}
+		f := newFakeIO()
+		c := newTestClient(f, SeqRealistic)
+		c.warn = w.warn
+
+		// One packet establishes where the peer is; only repeats are evidence that
+		// it is not moving, so the warning cannot fire before the fourth.
+		for i, label := range []string{"a", "b", "c"} {
+			feedFromServer(t, c, f, peerSeq, label)
+			if w.count() != 0 {
+				t.Errorf("peer_seq=%#x: warned after %d packets, too little evidence: %v", peerSeq, i+1, w.msgs)
+			}
+		}
+		feedFromServer(t, c, f, peerSeq, "d")
+		if w.count() != 1 {
+			t.Fatalf("peer_seq=%#x: want exactly one warning once the seq has clearly frozen, got %d: %v",
+				peerSeq, w.count(), w.msgs)
+		}
+
+		// However long the mismatch persists, the operator is told once.
+		for i := 0; i < 5; i++ {
+			feedFromServer(t, c, f, peerSeq, "e")
+		}
+		if w.count() != 1 {
+			t.Errorf("peer_seq=%#x: warning should fire once, got %d", peerSeq, w.count())
+		}
+		c.Close()
+	}
+}
+
+// TestNoWarnWhenWeDoNotAdvance: the warning is about OUR seq outrunning the
+// peer's ack, so it is meaningless unless our seq moves. In random mode both ends
+// stand still, which is a consistent pairing and must stay silent.
+func TestNoWarnWhenWeDoNotAdvance(t *testing.T) {
 	w := &warnRecorder{}
 	f := newFakeIO()
-	c := newTestClient(f, SeqRealistic)
+	c := newTestClient(f, SeqRandom)
 	c.warn = w.warn
 	defer c.Close()
 
-	// A fixed-mode peer sends seq=1 on every packet.
-	feedFromServer(t, c, f, carrierSeq, "a")
-	feedFromServer(t, c, f, carrierSeq, "b")
+	for i := 0; i < 8; i++ {
+		feedFromServer(t, c, f, 0x5A5A5A5A, "x")
+	}
 	if w.count() != 0 {
-		t.Errorf("should not warn on the first two packets (too little evidence), got %v", w.msgs)
-	}
-	feedFromServer(t, c, f, carrierSeq, "c")
-	if w.count() != 1 {
-		t.Fatalf("expected exactly one warning after three fixed-seq packets, got %d: %v", w.count(), w.msgs)
-	}
-
-	// However long the mismatch persists, the operator is told once.
-	for i := 0; i < 5; i++ {
-		feedFromServer(t, c, f, carrierSeq, "d")
-	}
-	if w.count() != 1 {
-		t.Errorf("warning should fire once, got %d", w.count())
+		t.Errorf("random+random is a valid pairing, got %v", w.msgs)
 	}
 }
 

@@ -59,15 +59,19 @@ func addrFromNet(a net.Addr) (net.IP, uint16, bool) {
 
 // Our receiver matches carrier packets by port and reads the payload; it never
 // inspects TCP seq/ack. In the default "fixed" seq mode we therefore keep seq
-// and ack CONSTANT and low, so that stateful conntrack/NAT on the path (home
-// router, ISP) always sees in-window packets. A climbing seq with a frozen ack
-// would eventually exceed the peer's ~64 KB window (the ack cannot advance,
-// since there is no real handshake), and the middlebox would start dropping
-// that direction — observed in the field as the return path dying at ~24s.
-// seq_mode: realistic escapes that trap differently: seq advances by payload
-// length AND the ack tracks what the peer sent, so each side's ack keeps raising
-// the window ceiling the other side's seq is checked against. That only holds if
-// BOTH ends run realistic — see seqState.checkPeerSeqMode in carrier.go.
+// and ack CONSTANT and low, so a stateful conntrack/NAT on the path (home
+// router, ISP CGNAT) always sees an in-window packet.
+//
+// That constancy is not timidity, it is the reason fixed mode is fast. A
+// middlebox that picks a flow up mid-stream can never see a SYN, so it can never
+// learn a window scale factor and is stuck at scale 0: it enforces
+// peer_seq <= our_ack + our_window, and our window can never exceed 65535. A
+// mode whose seq advances is therefore capped at 64 KB per RTT by that
+// middlebox — and worse, exceeding it deadlocks rather than throttles, because
+// the dropped packets are exactly the ones that would have advanced the ack that
+// reopens the window. A mode whose seq never moves has no such ceiling.
+//
+// See SeqMode for how each mode trades that off.
 const (
 	carrierSeq = 1
 	carrierAck = 1
@@ -150,25 +154,55 @@ func (f TCPFlags) String() string {
 type SeqMode string
 
 const (
-	// SeqFixed pins seq and ack to 1 on every segment (the original behaviour):
-	// maximally safe for window-tracking middleboxes, but a give-away to any
-	// observer that looks at more than one packet.
+	// SeqFixed pins seq and ack to 1 on every segment and sends no options (the
+	// original behaviour): fastest and safest, but a capture makes the tunnel
+	// obvious — no real connection sits at seq 1 packet after packet.
 	SeqFixed SeqMode = "fixed"
-	// SeqRealistic starts from a random ISN and advances seq by the payload
-	// length, acking what the peer sent, like a real established connection.
+	// SeqRandom keeps fixed mode's mechanics and removes its signature: a random
+	// ISN and a real ack position (adopted from the peer's first packet), both
+	// then held CONSTANT, plus a jittered window and RFC 7323 timestamps that do
+	// advance. Every packet looks like a plausible mid-stream segment, and to a
+	// state machine the flow is one segment being retransmitted — so no window
+	// ceiling applies and throughput matches fixed mode. This is the recommended
+	// mode when a capture of the link might be looked at.
+	SeqRandom SeqMode = "random"
+	// SeqRealistic is a fully coherent stream: a random ISN with seq advancing by
+	// the payload length and an ack that tracks the peer forward-only, exactly
+	// like an established connection.
+	//
+	// It is the most convincing mode and the slowest, and the trade is not a
+	// tuning matter: because no SYN is ever sent, no middlebox on the path can
+	// learn a window scale, so an advancing seq is hard-capped at one unscaled
+	// window (64 KB) per RTT. Run it above that and the flow does not slow down,
+	// it dies permanently — see InFlightLimit, which is why gfk clamps the
+	// transport's send window in this mode.
 	SeqRealistic SeqMode = "realistic"
 )
 
 // ParseSeqMode validates a config seq_mode value; empty means fixed.
 func ParseSeqMode(s string) (SeqMode, error) {
-	switch SeqMode(strings.ToLower(strings.TrimSpace(s))) {
-	case "", SeqFixed:
+	switch m := SeqMode(strings.ToLower(strings.TrimSpace(s))); m {
+	case "":
 		return SeqFixed, nil
-	case SeqRealistic:
-		return SeqRealistic, nil
+	case SeqFixed, SeqRandom, SeqRealistic:
+		return m, nil
 	}
-	return SeqFixed, fmt.Errorf("unknown value %q, want %q or %q", s, SeqFixed, SeqRealistic)
+	return SeqFixed, fmt.Errorf("unknown value %q, want %q, %q or %q", s, SeqFixed, SeqRandom, SeqRealistic)
 }
+
+// Advances reports whether this mode moves the sequence number as it sends. Only
+// modes that do are subject to a middlebox's window ceiling.
+func (m SeqMode) Advances() bool { return m == SeqRealistic }
+
+// Camouflaged reports whether this mode dresses the header up — random ISN,
+// jittered window, timestamp option — as opposed to fixed mode's bare, constant
+// one.
+//
+// Deliberately a positive test rather than "!= SeqFixed": the zero SeqMode is the
+// empty string, not SeqFixed, and a Carrier assembled without Open (tests) has
+// exactly that. Answering "yes, camouflaged" there would send it down the path
+// that needs a seqState nobody built.
+func (m SeqMode) Camouflaged() bool { return m == SeqRandom || m == SeqRealistic }
 
 // Window advertisement. maxWindow is what fixed mode sends on every segment and
 // the top of the range realistic mode varies within.
@@ -185,6 +219,32 @@ const (
 	maxWindow = 65535
 	minWindow = 64800
 )
+
+// inFlightBudget is how many payload bytes a sending side may keep outstanding in
+// a mode whose seq advances. It is deliberately well under minWindow.
+//
+// The constraint being respected is the middlebox's, not ours: it drops a packet
+// whose seq runs past peer_ack + peer_window, and peer_window can never exceed
+// 65535 because no SYN was sent to negotiate a scale. Three quarters leaves room
+// for the two things that widen the gap beyond "one window of fresh data":
+// the peer's ack is always one RTT stale, and retransmissions consume sequence
+// space too (the carrier's seq counts bytes SENT, not bytes acknowledged).
+//
+// Measured on a live path: with the transport free to keep ~180 KB in flight,
+// the first drop landed the moment the gap crossed 65535 and the flow then
+// deadlocked permanently — the drops themselves stop the ack that would reopen
+// the window. Staying under the ceiling turns that cliff into a plain rate cap.
+const inFlightBudget = minWindow * 3 / 4
+
+// InFlightLimit reports the maximum payload bytes this side may keep in flight in
+// the given seq mode, or 0 when no limit applies (a mode whose seq never moves
+// can never be out of window, so it runs at full speed).
+func InFlightLimit(mode SeqMode) int {
+	if mode.Advances() {
+		return inFlightBudget
+	}
+	return 0
+}
 
 // tsOptionLen is the on-the-wire size of the NOP,NOP,Timestamps option block that
 // realistic mode adds to every segment. It comes out of the payload budget — see
@@ -218,14 +278,15 @@ type segmentSpec struct {
 // every IP packet by that much and a path that was exactly at its MTU starts
 // black-holing DF-set packets.
 func TCPOptionBytes(mode SeqMode) int {
-	if mode == SeqRealistic {
+	if mode.Camouflaged() {
 		return tsOptionLen
 	}
 	return 0
 }
 
-// randomWindow picks a window advertisement for realistic mode: high, but not the
-// same value on every packet. See the minWindow comment for why the band is tight.
+// randomWindow picks a window advertisement for the camouflaged modes: high, but
+// not the same value on every packet. See the minWindow comment for why the band
+// is tight.
 func randomWindow() uint16 {
 	return uint16(minWindow + rand.UintN(maxWindow-minWindow+1))
 }

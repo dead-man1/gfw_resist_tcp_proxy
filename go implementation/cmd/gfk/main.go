@@ -157,14 +157,24 @@ func main() {
 	// is new here is the NIC gfk actually resolved.
 	logger.Info("carrier bound", logx.Addr("local_ip", car.LocalIP()), "interface", cfg.Carrier.Interface)
 
+	// Not cfg.KCP: seq_mode realistic cannot keep more than one unscaled TCP window
+	// in flight without a middlebox dropping the excess permanently, so the send
+	// window is clamped to fit. See config.EffectiveKCP.
+	kcpCfg, clamped := cfg.EffectiveKCP()
+	if clamped {
+		logger.Warn("kcp send window reduced to fit the carrier's window ceiling",
+			"sndwnd", kcpCfg.SndWnd, "configured", cfg.KCP.SndWnd, "seq_mode", cfg.Carrier.SeqMode,
+			"why", "an advancing seq cannot exceed 64 KB in flight without a SYN to negotiate window scaling; "+
+				"use seq_mode: random for the same camouflage at full speed")
+	}
 	params := transport.Params{
 		Transport: cfg.Transport,
 		Key:       cfg.Auth.Key,
-		// Not cfg.Carrier.MTU: realistic mode spends 12 header bytes on the
+		// Not cfg.Carrier.MTU: the camouflaged modes spend 12 header bytes on the
 		// timestamp option, and the IP packet must stay the same size either way.
 		MTU:              cfg.TransportMTU(),
 		KeepAliveSeconds: cfg.Client.KeepAliveSeconds,
-		KCP:              cfg.KCP,
+		KCP:              kcpCfg,
 		QUIC:             cfg.QUIC,
 	}
 
@@ -232,6 +242,10 @@ func runClient(ctx context.Context, cfg config.Config, car *carrier.Carrier, par
 		logger.Info(string(cfg.Transport)+" tunnel established to server", logx.Peer(remote))
 		return sess, nil
 	}, delay, logger)
+	// Abandon a tuple a middlebox has started black-holing after ~3s, rather than
+	// waiting ~16s for the transport keepalive to time out. The reconnect rotates
+	// ports, which is the only thing that helps.
+	sup.SetHealthCheck(car.Wedged)
 	go sup.Run(ctx)
 
 	logger.Info("client starting", "transport", cfg.Transport, logx.Addr("vps", cfg.Carrier.VPSIP))

@@ -52,6 +52,7 @@ type Supervisor struct {
 
 	state   atomic.Int32
 	onState func(State)
+	health  func() string
 }
 
 // New builds a Supervisor. delay is the pause between reconnection attempts.
@@ -64,6 +65,17 @@ func New(f Factory, delay time.Duration, log *slog.Logger) *Supervisor {
 // SetStateHook registers a callback invoked on every connection-state change.
 // Call it before Run.
 func (s *Supervisor) SetStateHook(f func(State)) { s.onState = f }
+
+// SetHealthCheck registers an optional liveness probe, polled while a session is
+// up. It returns "" for healthy, or a reason to tear the session down now.
+//
+// This exists because a session can be dead long before the transport notices.
+// When a middlebox starts discarding the carrier tuple, the transport keeps
+// retransmitting into it and only gives up when its keepalive times out — ~16 s
+// of a tunnel that is up, passing nothing, and cannot recover on this tuple. The
+// probe (carrier.Wedged) spots it in ~3 s so the reconnect can rotate ports.
+// Call it before Run.
+func (s *Supervisor) SetHealthCheck(f func() string) { s.health = f }
 
 // State reports the current connection state.
 func (s *Supervisor) State() State { return State(s.state.Load()) }
@@ -128,13 +140,20 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 }
 
-// waitDead returns when the session closes or ctx is cancelled.
+// waitDead returns when the session closes, the health check condemns it, or ctx
+// is cancelled.
 func (s *Supervisor) waitDead(ctx context.Context, sess transport.Session) {
 	t := time.NewTicker(500 * time.Millisecond)
 	defer t.Stop()
 	for {
 		if sess.IsClosed() {
 			return
+		}
+		if s.health != nil {
+			if why := s.health(); why != "" {
+				s.log.Warn("tunnel is up but not delivering; dropping it early", "reason", why)
+				return
+			}
 		}
 		select {
 		case <-ctx.Done():

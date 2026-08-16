@@ -54,17 +54,26 @@ The **CLI** (`cmd/gfk`, client + server) is cgo-free:
 
 ```sh
 # Linux server / Linux client:
-CGO_ENABLED=0 GOOS=linux  go build -o gfk      ./cmd/gfk
+CGO_ENABLED=0 GOOS=linux  go build -trimpath -ldflags "-s -w" -o gfk      ./cmd/gfk
 # Windows client (needs Npcap runtime installed on the target machine):
-CGO_ENABLED=0 GOOS=windows go build -o gfk.exe ./cmd/gfk
+CGO_ENABLED=0 GOOS=windows go build -trimpath -ldflags "-s -w" -o gfk.exe ./cmd/gfk
 ```
+
+`-trimpath` keeps local filesystem paths (including your username) out of the
+binary and makes the build reproducible; `-s -w` drop the symbol table and DWARF,
+which is most of the size. Omitting them produces a working but ~35% larger
+binary that has your home directory baked into every stack frame. `make` and the
+release workflow both pass them — use `make` rather than a bare `go build`.
 
 The **Windows GUI** (`cmd/gfk-gui`, Fyne) is built separately behind the `gui`
 build tag and needs cgo + a C compiler (mingw-w64):
 
 ```sh
-CGO_ENABLED=1 go build -tags gui -o gfk-windows-GUI.exe ./cmd/gfk-gui
+CGO_ENABLED=1 go build -tags gui -trimpath -ldflags "-s -w -H windowsgui" -o gfk-windows-GUI.exe ./cmd/gfk-gui
 ```
+
+`-H windowsgui` is what stops a console window opening behind the app. Drop it
+(keeping everything else) if you need a build that prints panics to a terminal.
 
 > Caveat: `go mod tidy` run *without* `-tags gui` will prune Fyne from `go.mod`
 > (it's only imported under that tag). If that happens, `go get fyne.io/fyne/v2`
@@ -172,8 +181,9 @@ honoured — it is the destination side you are watching.
 **If each reconnect only works on the *next* port** — and restarting both ends
 does not help — that is stale middlebox state, not a blocked port. A conntrack /
 CGNAT entry outlives the session (Linux holds ESTABLISHED for five days) and still
-expects the previous session's sequence window, so `seq_mode: realistic`, which
-opens each session at a fresh random ISN, gets dropped on that tuple forever.
+expects the previous session's sequence window, so `seq_mode: random` and
+`seq_mode: realistic`, which open each session at a fresh random ISN, get dropped
+on that tuple forever.
 
 The client handles this by sending a bare TCP RST on a tuple whenever it **lets go
 of** one — session lost, connect attempt failed, or shutdown. Resetting on release
@@ -188,6 +198,24 @@ timer, 10 s on Linux (`nf_conntrack_tcp_timeout_close`), and a shorter wait is
 worse than none, because each retry restarts that timer and the tunnel never
 connects. Turn it on, get connected once, turn it off.
 
+
+### Sequence numbers (`seq_mode`)
+
+What the TCP seq/ack fields of carrier packets do. **Must match on both ends.**
+
+| | header per packet | flow as a whole | speed |
+|---|---|---|---|
+| `fixed` (default) | `seq = ack = 1`, constant window, no options | nothing to track | full |
+| `random` | random ISN + the peer's real ack, jittered window, RFC 7323 timestamps | seq never moves — reads as one segment retransmitted | full |
+| `realistic` | same, but seq advances with the payload | reassembles into a genuine TCP stream | **capped ~64 KB/RTT** |
+
+
+### Automatic Port Rotation
+
+the client also watches the tuple it is using. If nothing arrives for 3 s
+while it is actively transmitting, the tuple is being black-holed somewhere on the
+path, and gfk drops the session and rotates ports immediately rather than waiting
+out the ~16 s transport keepalive on a connection that cannot recover.
 
 ### Restricting destination ports (server)
 
