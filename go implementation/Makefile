@@ -37,9 +37,30 @@ SYSO := cmd/gfk-gui/resource_windows_amd64.syso
 # ships no icon today, so the flag is omitted rather than pointing at nothing.
 ICON := $(wildcard cmd/gfk-gui/icon.ico)
 
-.PHONY: all cli-linux cli-windows gui syso test clean
+.PHONY: all cli-linux cli-windows gui syso dist-all release-cli checksums test clean
 
 all: cli-linux cli-windows
+
+# Everything a release publishes, under the release's own asset names, so what
+# comes out of dist/ locally is what comes out of the workflow. `all` above stays
+# as it was: two quick host-shaped builds named gfk / gfk.exe for development.
+dist-all: release-cli gui
+
+# The CLI matrix from .github/workflows/release.yml, in the same order. Keep the
+# two in step. All of it is cgo-free, which is why one host cross-compiles the
+# lot; only the GUI needs a C toolchain and so only the GUI is host-bound.
+release-cli:
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64       $(BUILD) -o dist/gfk-linux-amd64       ./cmd/gfk
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64       $(BUILD) -o dist/gfk-linux-arm64       ./cmd/gfk
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm GOARM=7 $(BUILD) -o dist/gfk-linux-armv7       ./cmd/gfk
+	CGO_ENABLED=0 GOOS=linux   GOARCH=386         $(BUILD) -o dist/gfk-linux-386         ./cmd/gfk
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64       $(BUILD) -o dist/gfk-windows-amd64.exe ./cmd/gfk
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64       $(BUILD) -o dist/gfk-windows-arm64.exe ./cmd/gfk
+
+# Same list the release attaches, so a local dist/ can be diffed against a
+# published one hash for hash.
+checksums:
+	cd dist && sha256sum gfk-linux-* gfk-windows-* > SHA256SUMS.txt && cat SHA256SUMS.txt
 
 cli-linux:
 	CGO_ENABLED=0 GOOS=linux $(BUILD) -o dist/gfk ./cmd/gfk

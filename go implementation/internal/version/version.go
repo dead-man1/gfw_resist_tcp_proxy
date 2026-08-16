@@ -18,7 +18,7 @@ const (
 	Name = "gfk tunnel"
 	// Version is the release. Bump this for a release; that is the only edit a
 	// routine version bump needs.
-	Version = "v2.0"
+	Version = "v3.0"
 	// URL is the project home, shown in the banner.
 	URL = "https://github.com/GFW-knocker/gfw_resist_tcp_proxy/"
 	// Dedication is the line under the URL.
@@ -28,17 +28,17 @@ const (
 // rule is the character the banner's top and bottom lines are drawn with.
 const rule = "="
 
-// String is the short identity, e.g. "gfk tunnel v2.0". Use it in log attributes
+// String is the short identity, e.g. "gfk tunnel v3.0". Use it in log attributes
 // and anywhere a single line is wanted.
 func String() string { return Name + " " + Version }
 
-// Title is the desktop window title, e.g. "GFW-Knocker - gfk tunnel v2.0".
+// Title is the desktop window title, e.g. "GFW-Knocker - gfk tunnel v3.0".
 func Title() string { return Org + " - " + String() }
 
 // Banner returns the multi-line startup banner, without a trailing newline:
 //
 //	====================================================
-//	                  gfk tunnel v2.0
+//	                  gfk tunnel v3.0
 //	https://github.com/GFW-knocker/gfw_resist_tcp_proxy/
 //	              in memory of Mahsa-Amini
 //	====================================================

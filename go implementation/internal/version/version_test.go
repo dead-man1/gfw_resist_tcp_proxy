@@ -15,7 +15,7 @@ func TestString(t *testing.T) {
 	}
 }
 
-// TestTitle pins the desktop window title: "GFW-Knocker - gfk tunnel v2.0".
+// TestTitle pins the desktop window title: "GFW-Knocker - gfk tunnel v3.0".
 func TestTitle(t *testing.T) {
 	if got, want := Title(), Org+" - "+String(); got != want {
 		t.Errorf("Title() = %q, want %q", got, want)
